@@ -1,0 +1,2793 @@
+---
+title: "ASH 5 EQ Model"
+author: "Jacob Allred and Twarit Tarpara"
+date: "09/2022"
+output:
+  html_document:
+    code_folding: hide
+    toc: true
+---
+
+# Start {.tabset}
+
+## Load Data and Libraries
+
+Loading in a few different data sets and libraries for modeling and validation
+
+```{r Get_Data}
+setwd("L:/Underwriting/Scorecard/Models/EQ_RETRO")
+borr_df <- read.csv("EQ_RETRO_TOP_VARIABLES.csv")
+dictionary <- read.csv("EQ Variables Summary.csv")
+borr_df_apps <- read.csv("EQ_RETRO_TOP_VARIABLES_APPS.csv")
+ASH5_TU_Super8 <- read.csv("ASH5_TU_Super8.csv")
+
+
+```
+
+```{r Load_Libraries, message=FALSE, warning=FALSE}
+library(dplyr)
+library(caret)
+library(doParallel)
+library(Information)
+library(reshape)
+library(skimr)
+library(pROC)
+library(tidyverse)
+library(scales)
+library(sqldf)
+library(gt)
+library(gtExtras)
+library(formattable)
+library(plotly)
+library(Metrics)
+library(Hmisc)
+library(lubridate)
+library(woeBinning)
+library(scorecard)
+library(ROCR)
+library(glmnet)
+library(corrplot)
+library(ggcorrplot)
+options(scipen = 999) #Prevent Scientific Notations
+
+#Set a color scale from green_white_red
+green_white_red_color_scale <-
+  scales::col_numeric(c("green", "white", "red"), domain = NULL)
+#Set a color scale from white to blue
+white_green_color_scale <-
+  scales::col_numeric(c("white", "dark green"), domain = NULL)
+
+
+```
+
+## Data Cleanup
+
+Cleaning up some variables or changing their data type
+
+```{r DATA_Review, warning=FALSE}
+
+## Join in ASH5_TU
+ASH5_TU_Super8 <- ASH5_TU_Super8 %>%
+  select(customerInput_scorereference, Borrower, ASH5_TU, evtg04_finscore)
+
+borr_df <- dplyr::left_join(borr_df, ASH5_TU_Super8, by = c('APP_NUM' = 'customerInput_scorereference', 'Borrower'='Borrower'))
+
+
+##Clean up variables 
+#Clean to Dates
+borr_df$Month <- as.Date(borr_df$Month, "%m/%d/%Y")
+borr_df_apps$Month <- as.Date(borr_df_apps$Month, "%m/%d/%Y")
+
+#Clean to Numeric
+borr_df$CREDIT_SCORE_AVG_CALC <- as.numeric(borr_df$CREDIT_SCORE_AVG_CALC)
+borr_df_apps$CREDIT_SCORE_AVG_CALC <- as.numeric(borr_df_apps$CREDIT_SCORE_AVG_CALC)
+
+borr_df$Employment_Months <- as.numeric(borr_df$Employment_Months)
+borr_df_apps$Employment_Months <- as.numeric(borr_df_apps$Employment_Months)
+
+
+borr_df$ASH4_TU <- as.numeric(borr_df$ASH4_TU)
+borr_df$ASH4_MCE <- as.numeric(borr_df$ASH4_MCE)
+borr_df$Income <- as.numeric(borr_df$Income)
+
+borr_df$Residence.Time <- as.numeric(borr_df$Residence.Time)
+borr_df_apps$Residence.Time <- as.numeric(borr_df_apps$Residence.Time)
+
+# Clean to Factors
+borr_df$State <- as.factor(borr_df$State)
+borr_df_apps$State <- as.factor(borr_df_apps$State)
+
+
+#ADD IN DV in borrower data
+borr_df$Performance <- borr_df$NEW_DV
+borr_df$Performance_factor <- as.factor(borr_df$Performance)
+borr_df$Performance_factor <-
+  ifelse(borr_df$Performance_factor == 1, "BAD", "GOOD")
+borr_df$Performance_factor <- as.factor(borr_df$Performance_factor)
+borr_df$Old_DV <-
+  ifelse(borr_df$customerInput_foursighttarget == "Bad", 1, 0)
+borr_df <- borr_df %>%
+  dplyr::select(-c("NEW_DV"))
+
+
+#ADD IN DV in all applications data
+borr_df_apps$Performance <- borr_df_apps$NEW_DV
+borr_df_apps$Performance_factor <- as.factor(borr_df_apps$Performance)
+borr_df_apps$Performance_factor <-
+  ifelse(borr_df_apps$Performance_factor == 1, "BAD", "GOOD")
+borr_df_apps$Performance_factor <- as.factor(borr_df_apps$Performance_factor)
+borr_df_apps$Old_DV <-
+  ifelse(borr_df_apps$customerInput_foursighttarget == "Bad", 1, 0)
+borr_df_apps <- borr_df_apps %>%
+  dplyr::select(-c("NEW_DV"))
+
+
+
+
+######Binning
+borr_df$Vantage_BIN <-
+  cut(
+    borr_df$Score_5402,
+    breaks = c(-Inf, 540, 580, 620, 660,700,740,780,Inf),
+    include.lowest = TRUE,
+    right = FALSE
+  )
+
+
+borr_df_apps$Vantage_BIN <-
+  cut(
+    borr_df_apps$Score_5402,
+    breaks = c(-Inf, 540, 580, 620, 660,700,740,780,Inf),
+    include.lowest = TRUE,
+    right = FALSE
+  )
+
+
+
+### We have a few records where some data is missing. Filtering those out. 
+borr_df <- borr_df %>% 
+  filter(!is.na(Employment_Months))
+
+borr_df <- borr_df %>% 
+  filter(!is.na(Residence.Time))
+
+### Creating and renaming Variable_woe column in dictionary dataset
+# dictionary$x <- paste(dictionary$Variable,'woe',sep = '_')
+# rename(dictionary, Variable_woe = x)
+
+### Setting trade lines age value to 0 for invalid values
+borr_df$NO_TRADE_ON_FILE <- ifelse(borr_df$CRP02_0119010000 == 999, 1, 0)
+borr_df_apps$NO_TRADE_ON_FILE <- ifelse(borr_df_apps$CRP02_0119010000 == 999, 1, 0)
+
+borr_df$NO_TRADE_ON_FILE_T24 <- ifelse(borr_df$TDA19621 == 999, 1, 0)
+borr_df_apps$NO_TRADE_ON_FILE_T24 <- ifelse(borr_df_apps$TDA19621 == 999, 1, 0)
+
+borr_df$DATAX_HIT <- ifelse(borr_df$Name60Days >=1,1,0)
+borr_df_apps$DATAX_HIT <- ifelse(borr_df_apps$Name60Days >=1,1,0)
+
+
+borr_df$NULL_Score_2354_1 <- ifelse(borr_df$Score_2354_1 > 90000, 1, 0)
+borr_df_apps$NULL_Score_2354_1 <- ifelse(borr_df_apps$Score_2354_1 > 90000, 1, 0)
+
+borr_df$Score_2354_1 <- ifelse(borr_df$Score_2354_1 > 90000, 0, borr_df$Score_2354_1)#FICO Auto 8
+borr_df_apps$Score_2354_1 <- ifelse(borr_df_apps$Score_2354_1 > 90000, 0, borr_df_apps$Score_2354_1)#FICO Auto 8
+
+
+
+```
+
+## Variable Selection
+
+We have over 2000 variables to work with. Through extensive review of the types of variables, we whittled the variable list down to about 200. This makes the data and variable review more manageable. We acknowledge that some useful variables may have been excluded during this process.
+
+```{r Variable Selection}
+borr_df_simple <- borr_df %>% 
+dplyr::select(-c(ATTR6028,TDA01425,TDA01625, TDA01615, TDA01225, TDA01215, 
+                 evtg04_finscore, Employment_Months))
+
+```
+
+# Borrower Model {.tabset}
+
+**Objective:** Predict the risk of each borrower when applying for an auto loan with Foursight Capital. We are specifically targeting whether a borrower defaults in the first 24 months of the life of the loan. Due to the macroeconomic effects starting in the Spring of 2020 due to COVID-19, we have found the need to artificially change the target variable for some loans.
+
+**Data Used:** Using funded loans with an application date between 2018 and July 2019. In total we have close to 34,000 borrowers.
+
+## Train/Test/Holdout Split
+
+To measure how the model performs out of sample in the future we will partition out the last 3 application months. This will be known as the "Holdout". Further we will partition off 25% of our "Holdin" sample as a test to measure out of sample performance from our train data set.
+
+```{r TRAIN/TEST}
+#Train/test Split and Time Series Holdout
+###Create time holdout
+borr_holdout <- borr_df_simple %>%
+  filter(Month >= "2019-05-31")
+borr_holdin <- borr_df_simple %>%
+  filter(Month < "2019-05-31")
+
+## set the seed to make your partition reproducible
+set.seed(24601)
+borr_split <-
+  createDataPartition(
+    borr_holdin$Performance_factor,
+    p = .75,
+    list = FALSE,
+    times = 1
+  )
+
+borr_train <- borr_holdin[borr_split,]
+borr_test <- borr_holdin[-borr_split,]
+
+borr_df %>%
+  summarise(
+    Count = n(),
+    Default_Rate = formattable::percent(mean(Performance)),
+    Default_Rate_Unaltered = formattable::percent(mean(Old_DV)),
+    ASH5_TU = formattable::percent(mean(ASH5_TU)),
+    ASH4_TU = formattable::percent(mean(ASH4_TU))
+  ) %>%
+  gt() %>%
+  tab_header(title = "Full Data Set") %>%
+  gt_theme_espn()
+
+borr_holdin %>%
+  summarise(
+    Count = n(),
+    Default_Rate = formattable::percent(mean(Performance)),
+    Default_Rate_Unaltered = formattable::percent(mean(Old_DV)),
+    ASH5_TU = formattable::percent(mean(ASH5_TU)),
+    ASH4_TU = formattable::percent(mean(ASH4_TU))
+  ) %>%
+  gt() %>%
+  tab_header(title = "HoldIn Data Set") %>%
+  gt_theme_espn()
+
+borr_train %>%
+  summarise(
+    Count = n(),
+    Default_Rate = formattable::percent(mean(Performance)),
+    Default_Rate_Unaltered = formattable::percent(mean(Old_DV)),
+    ASH5_TU = formattable::percent(mean(ASH5_TU)),
+    ASH4_TU = formattable::percent(mean(ASH4_TU))
+  ) %>%
+  gt() %>%
+  tab_header(title = "Train Data Set") %>%
+  gt_theme_espn()
+
+borr_test %>%
+  summarise(
+    Count = n(),
+    Default_Rate = formattable::percent(mean(Performance)),
+    Default_Rate_Unaltered = formattable::percent(mean(Old_DV)),
+    ASH5_TU = formattable::percent(mean(ASH5_TU)),
+    ASH4_TU = formattable::percent(mean(ASH4_TU))
+  ) %>%
+  gt() %>%
+  tab_header(title = "Test Data Set") %>%
+  gt_theme_espn()
+
+borr_holdout %>%
+  summarise(
+    Count = n(),
+    Default_Rate = formattable::percent(mean(Performance)),
+    Default_Rate_Unaltered = formattable::percent(mean(Old_DV)),
+    ASH5_TU = formattable::percent(mean(ASH5_TU)),
+    ASH4_TU = formattable::percent(mean(ASH4_TU))
+  ) %>%
+  gt() %>%
+  tab_header(title = "Holdout Data Set (May-July 2019)") %>%
+  gt_theme_espn()
+
+```
+
+## Borrower WOE
+
+As part of the modeling process we will create Weight of Evidence (WOE) variables. This process helps us to capture relationships of an independent variable to the dependent variable that are non-linear. For example, many of the TU variables will have values of -4 or -1 to represent NULL or not present. The WOE process helps us partition those values into a separate category from the rest of the data. We have applied a WOE value for almost all of our variables. The WOE values are trained based off our training data set.
+
+```{r New WOE, echo=TRUE, message=FALSE, warning=FALSE}
+
+borr_woe_breaks_list <- list(#Score_5402=c(5,540,560,580,590,600,620,640,660,680,700,750),
+                             Score_5402=c(5,500,515,530,545,560,575,590,605,620,635,650,665,680,695,710,750),
+                             Score_2354_1= c(400,540,580,600,620,640,660,680,720,760,800),
+                             CRP02_0119290000 =c(12,18,24,36,48,60,84,120,992),
+                             CRP02_0119010000 = c(12,18,24,36,48,60,72,84,120,180,240,300,992), 
+                             CRP02_0106460000 = c(2,12,992),
+                             CRP02_0123030000 = c(12,24,36,48,60,72,992),
+                             CRP02_0115460000 = c(50,100,200,900),
+                             #CRP02_0111030000 = c(18,36,54,72),
+                             CRP02_0119090000 = c(30,60,900),
+                             CRP02_0117290000 = c(15,30,60,900),
+                             TDA44621 = c(20,40,60),
+                             CRP02_0111030000 = c(20,990),
+                             CRP02_1104050000 = c(120,992),
+                             CRP02_1101014001 = c(8,92),
+                             TDA02615 = c(0,900),
+                             CRP02_0119510000 = c(12,24,36,48,60,72,992),
+                             CRP02_0222037600 = c(0,1,2,3,10,92),
+                             CRP02_0119080000 = c(12,24,36,48,992),
+                             CRP02_0117010000 = c(6,12,24,36,60,992),
+                             CRP02_0119450000 =c(6,12,18,24,36,48,60,120,180,240,360,992),
+                             Income = c(2000,3000,4000,5000,6000,8000,10000),
+                             Residence.Time = c(6,12,60,120),
+                             Employment_Months = c(6,12,24,36,60,120,240),
+                             CRP02_0119470000 = c(12,24,36,48,60,90,120,180,992),
+                             CRP02_0123010000 = c(12,24,36,48,60,72,84,992),
+                             CRP02_0106470000 =c(2,12,992),
+                             TDA19621 = c(1,20,40,60,80,95,100,105,992),
+                             CRP02_0501458000 = c(.01,.2,.4,.6,.8,.95,1,9),
+                             TDA19625 = c(1,20,40,60,80,95,100,105,992),
+                             UniqueMemberInquiries180Days = c(1,2,3),
+                             TT_INQALL24 = c(1,3,5,7),
+                             TT_OMINQ730 = c(1,3,5,7),
+                             TT_UMINQ730 = c(1,2,3,4),
+                             CRP02_0101350000 = c(12,992,999),
+                             CRP02_0123290000 = c(12,24,36,48,60,72,992),
+                             CRP02_0119120000 = c(12,24,48,72,120,992),
+                             CRP02_0910017000 = c(.2,.4,.6,.8,1,9),
+                             TDA35745 = c(-100,0,1,992),
+                             ATTR6003 = c(0,1,500,1000,2000,5000),
+                             TDA33425 = c(0,100,200,9992),
+                             ATTR6048 = c(1,2000,10000),
+                             TT_RECINQM_XCR = c(1,12,36),
+                             ATTR6049 = c(1,500,1000,2000,5000,10000,20000,50000),
+                             VendorInquiries60Days = c(1,2))
+
+#borr_woe_special_values = list()
+woe_columns_df <- borr_train %>% dplyr::select(-c("APP_NUM","Performance_factor","Borrower","APP_DATE",
+                "customerInput_foursighttarget", "Month","Category.Level.Name","ASH4_TU",                 "ASH4_MCE","ASH4_MCE_SCORE","CREDIT_SCORE_AVG_CALC","Performance",
+                "Performance_factor", "NULL_Score_2354_1", "State", "Vantage_BIN",
+                "Name60Days",#"DATAX_HIT",
+                "NO_TRADE_ON_FILE_T24", "NO_TRADE_ON_FILE",
+                "Old_DV", "ASH5_TU"))
+
+col_names <- colnames(woe_columns_df)
+
+borr_woe_bins <- woebin(borr_train,
+                        y="Performance_factor", 
+                        x = col_names,
+                        positive = "BAD",
+                        breaks_list = borr_woe_breaks_list,
+                        # special_values = borr_woe_special_values,
+                        no_cores = 4, count_distr_limit = .01)
+
+xyz <- borr_woe_bins$ATTR6003
+
+write.csv(xyz,'xyz.csv')
+
+woebin_plot(borr_woe_bins$CRP02_1104050000,  show_barval = FALSE)
+
+
+```
+
+```{r Apply WOE, message=FALSE, warning=FALSE}
+
+##This process applies the WOE values to each of the variables from all the data sets
+borr_train_woe <- woebin_ply(borr_train, bins = borr_woe_bins, to = "woe", no_cores = 2, print_step = 0)
+
+borr_test_woe <- woebin_ply(borr_test, bins = borr_woe_bins, to = "woe", no_cores = 2)
+
+borr_holdout_woe <- woebin_ply(borr_holdout, bins = borr_woe_bins, to = "woe", no_cores = 2)
+
+borr_apps_woe <- woebin_ply(borr_df_apps, bins = borr_woe_bins, to = "woe", no_cores = 2)
+
+```
+
+```{r BORR_WOE_MANIPULATION}
+
+###Vantage Score
+borr_train_woe <- borr_train_woe %>% 
+  mutate(Score_5402_mod_woe = case_when(Score_5402_woe == '0.959405577348302'  ~   1.001021,
+                                        Score_5402_woe == '0.697834648900207'   ~  0.861368,
+                                        Score_5402_woe == '0.694862878511049'   ~  0.724346,
+                                        Score_5402_woe == '0.660655645658453'   ~  0.679350,
+                                        Score_5402_woe == '0.654159585397545'   ~   0.555272,
+                                        TRUE ~ Score_5402_woe
+                                        )
+         )
+
+borr_test_woe <- borr_test_woe %>% 
+  mutate(Score_5402_mod_woe = case_when(Score_5402_woe == '0.959405577348302'  ~   1.001021,
+                                        Score_5402_woe == '0.697834648900207'    ~  0.861368,
+                                        Score_5402_woe == '0.694862878511049'    ~  0.724346,
+                                        Score_5402_woe == '0.660655645658453'    ~  0.679350,
+                                        Score_5402_woe == '0.654159585397545'    ~   0.555272,
+                                        TRUE ~ Score_5402_woe
+                                        )
+         )
+
+borr_holdout_woe <- borr_holdout_woe %>% 
+  mutate(Score_5402_mod_woe = case_when(Score_5402_woe == '0.959405577348302'  ~   1.001021,
+                                        Score_5402_woe == '0.697834648900207'    ~  0.861368,
+                                        Score_5402_woe == '0.694862878511049'    ~  0.724346,
+                                        Score_5402_woe == '0.660655645658453'    ~  0.679350,
+                                        Score_5402_woe == '0.654159585397545'    ~   0.555272,
+                                        TRUE ~ Score_5402_woe
+                                        )
+         )
+
+borr_apps_woe <- borr_apps_woe %>%
+  mutate(Score_5402_mod_woe = case_when(Score_5402_woe == '0.959405577348302'  ~   1.001021,
+                                        Score_5402_woe == '0.697834648900207'    ~  0.861368,
+                                        Score_5402_woe == '0.694862878511049'     ~  0.724346,
+                                        Score_5402_woe == '0.660655645658453'    ~  0.679350,
+                                        Score_5402_woe == '0.654159585397545'     ~   0.555272,
+                                        TRUE ~ Score_5402_woe
+                                        )
+         )
+
+
+borr_train_woe <- borr_train_woe %>% 
+  mutate(ATTR6003_mod_woe = case_when(ATTR6003_woe == '0.0818434826108565' ~  0.052890,
+                                      ATTR6003_woe == '0.29887574461478' ~  0.233764,
+                                      ATTR6003_woe == '0.33321887601851' ~  0.360676,
+                                      ATTR6003_woe == '0.380949545554299' ~  0.562915,
+                                      TRUE ~ ATTR6003_woe
+                                      )
+         )
+                                      
+borr_test_woe <- borr_test_woe %>% 
+  mutate(ATTR6003_mod_woe = case_when(ATTR6003_woe == '0.0818434826108565' ~  0.052890,
+                                      ATTR6003_woe == '0.29887574461478' ~  0.233764,
+                                      ATTR6003_woe == '0.33321887601851' ~  0.360676,
+                                      ATTR6003_woe == '0.380949545554299' ~  0.562915,
+                                      TRUE ~ ATTR6003_woe
+                                      )
+         )
+                                      
+borr_holdout_woe <- borr_holdout_woe %>% 
+  mutate(ATTR6003_mod_woe = case_when(ATTR6003_woe == '0.0818434826108565' ~  0.052890,
+                                      ATTR6003_woe == '0.29887574461478' ~  0.233764,
+                                      ATTR6003_woe == '0.33321887601851' ~  0.360676,
+                                      ATTR6003_woe == '0.380949545554299' ~  0.562915,
+                                      TRUE ~ ATTR6003_woe
+                                      )
+         )
+                                      
+borr_apps_woe <- borr_apps_woe %>% 
+  mutate(ATTR6003_mod_woe = case_when(ATTR6003_woe == '0.0818434826108565' ~  0.052890,
+                                      ATTR6003_woe == '0.29887574461478' ~  0.233764,
+                                      ATTR6003_woe == '0.33321887601851' ~  0.360676,
+                                      ATTR6003_woe == '0.380949545554299' ~  0.562915,
+                                      TRUE ~ ATTR6003_woe
+                                      )
+         )
+
+# test <- borr_train_woe %>% 
+#   select(Score_5402_woe, evtg04_finscore_mod_woe) %>% 
+#   filter(Score_5402_woe >= .9)
+
+```
+
+
+
+## Variable Selection
+
+A few more variables need to be filtered out of our data set so we can train our model. Some of these variables are App_Num, ASH4 score, Month, and etc. These cannot be used for modeling but will be helpful in our review process. Also, we filter out any variables that have been flagged during the variable review process. For example, variables relating to inquiries all have the inherit flaw in that the retro data is as of the previous month end. Inquiries as part of the application process with Foursight are not included in the retro data and therefore make them unusable in a live environment.
+
+```{r Borrower Model Variables}
+##Train Variables
+borr_train_variables <- borr_train_woe %>%
+  dplyr::select(-c(1:11, 13,14,16,87,91))
+
+#test Variables
+borr_test_variables <- borr_test_woe %>% 
+  dplyr::select(-c(1:11, 13,14,16,87,91))
+
+#Holdout Variables
+borr_holdout_variables <- borr_holdout_woe %>% 
+  dplyr::select(-c(1:11, 13,14,16,87,91))
+
+borr_apps_variables <- borr_apps_woe %>% 
+  dplyr::select(-c(1:18, 20,93,97))
+
+
+```
+
+## Borrower Model
+
+Our borrower model is using a Generalized Logistic Regression with Lasso feature selection. The Lasso feature selections will automatically select those features that are useful, discarding the useless or redundant features. We artfully do our best to find a good balance between predictive power (measured by AUC on the train set), over-fit (measured by out of sample AUC), and model complexity (number of variables). The rule of Occam's razor is followed as the simplest model producing similar results is best.
+
+The first chart gives us a sense of cross validated models and their respective AUC with different lambda (Penalty factors) and their corresponding number of variables. For our model we chose the middle ground between the two dotted lines.
+
+```{r glmnet current, message=FALSE, warning=FALSE, paged.print=TRUE}
+
+##One Hot Encoding variable selection
+borr_train_xfac <- borr_train_variables %>% 
+  dplyr::select(State, Vantage_BIN)
+
+borr_test_xfac <- borr_test_variables %>% 
+  dplyr::select(State, Vantage_BIN)
+
+borr_holdout_xfac <- borr_holdout_variables %>% 
+  dplyr::select(State, Vantage_BIN)
+
+borr_apps_xfac <- borr_apps_variables %>% 
+  dplyr::select(State, Vantage_BIN)
+
+
+###Do the One Hot
+borr_xfac <- makeX(borr_train_xfac,borr_test_xfac)
+borr_xfac2 <- makeX(borr_train_xfac,borr_holdout_xfac)
+borr_xfac3 <- makeX(borr_train_xfac,borr_apps_xfac)
+
+
+##Create X Data Sets
+borr_train_x <- borr_train_variables %>% 
+  dplyr::select(-c(Performance_factor, State, Vantage_BIN)) %>% 
+as.matrix()
+
+borr_test_x <- borr_test_variables %>% 
+  dplyr::select(-c(Performance_factor, State,Vantage_BIN)) %>% 
+as.matrix()
+
+borr_holdout_x <- borr_holdout_variables %>% 
+  dplyr::select(-c(Performance_factor, State, Vantage_BIN)) %>% 
+as.matrix()
+
+borr_apps_x <- borr_apps_variables %>% 
+  dplyr::select(-c(Performance_factor, State, Vantage_BIN)) %>% 
+as.matrix()
+
+
+###Join One Hot and Continuous
+borr_train_x <- cbind(borr_train_x,borr_xfac$x)
+borr_test_x <- cbind(borr_test_x,borr_xfac$xtest)
+borr_holdout_x <- cbind(borr_holdout_x,borr_xfac2$xtest)
+borr_apps_x <- cbind(borr_apps_x,borr_xfac3$xtest)
+
+
+##Create Y Data Sets
+borr_train_y <- borr_train_variables %>% 
+  dplyr::select (Performance_factor) %>% 
+  as.matrix()
+
+## Assigning Penalty Factor
+borr_p.fac_c <- rep(1,ncol(borr_train_x))
+borr_p.fac_c[which(colnames(borr_train_x)=="DATAX_HIT")] <- .75
+borr_p.fac_c[which(colnames(borr_train_x)=="CRP02_0119290000_woe")] <- .75
+borr_p.fac_c[which(colnames(borr_train_x)=="CRP02_0119510000_woe")] <- .75
+borr_p.fac_c[which(colnames(borr_train_x)=="Score_5402_woe")] <- .05
+borr_p.fac_c[which(colnames(borr_train_x)=="CRP02_0106460000_woe")] <- .75
+borr_p.fac_c[which(colnames(borr_train_x)=="CRP02_0117010000_woe")] <- .75
+borr_p.fac_c[which(colnames(borr_train_x)=="CRP02_0119470000_woe")] <- .75
+borr_p.fac_c[which(colnames(borr_train_x)=="CRP02_0123030000_woe")] <- .75
+borr_p.fac_c[which(colnames(borr_train_x)=="CRP02_0119120000_woe")] <- .75
+borr_p.fac_c[which(colnames(borr_train_x)=="CRP02_0501458000_woe")] <- .75
+borr_p.fac_c[which(colnames(borr_train_x)=="CRP02_1104050000_woe")] <- .5
+borr_p.fac_c[which(colnames(borr_train_x)=="CRP02_1101014001_woe")] <- .5
+borr_p.fac_c[which(colnames(borr_train_x)=="TDA35745_woe")] <- .75
+borr_p.fac_c[which(colnames(borr_train_x)=="ATTR6003_woe")] <- .5
+borr_p.fac_c[which(colnames(borr_train_x)=="TDA19625_woe")] <- .5
+borr_p.fac_c[which(colnames(borr_train_x)=="ATTR6049_woe")] <- .5
+borr_p.fac_c[which(colnames(borr_train_x)=="VendorInquiries60Days_woe")] <- .65
+borr_p.fac_c[which(colnames(borr_train_x)=="UniqueMemberInquiries180Days_woe")] <- .5
+borr_p.fac_c[which(colnames(borr_train_x)=="TT_INQALL24_woe")] <- .65
+borr_p.fac_c[which(colnames(borr_train_x)=="TT_UMINQ730_woe")] <- .5
+#borr_p.fac_c[which(colnames(borr_train_x)=="Employment_Months_woe")] <- .75
+borr_p.fac_c[which(colnames(borr_train_x)=="TT_OMINQ730_woe")] <- 2
+
+#borr_p.fac_c[which(colnames(borr_train_x)=="evtg04_finscore_woe")] <- .75
+
+
+##Glmnet Model
+set.seed(24601)
+borr_glmnet_model <-cv.glmnet(borr_train_x, borr_train_y, family ="binomial",
+                    alpha = 1, 
+                    type.measure = "auc", 
+                    penalty.factor = borr_p.fac_c,
+                    dfmax = 40)
+
+plot(borr_glmnet_model, label = TRUE)
+
+borr_glmnet_model
+lambda <- borr_glmnet_model$lambda.1se
+
+var_list <- coef(borr_glmnet_model, s = lambda)
+
+
+
+
+
+```
+
+
+```{r Calculate Information Value}
+iv <- iv(borr_df,
+         x = col_names,
+         y='Performance_factor',
+         positive = 'BAD') %>%
+  as_tibble() %>% 
+  mutate(info_value = round(info_value, 3)) %>% 
+  arrange(desc(info_value))
+
+iv %>% knitr::kable()
+
+iv <- iv %>% mutate(variable_woe = paste(variable,'_woe', sep="" ))
+
+```
+
+## Model Coefficients
+
+Our final model coefficients are shown below.
+
+```{r Borr_Coef, warning=FALSE}
+## Coefficients
+
+borr_model_coef <- coef(borr_glmnet_model, s = lambda) %>% 
+  as.matrix()  %>% 
+  as.data.frame() %>% 
+  filter(s1 != 0)
+
+borr_model_coef <-
+  setNames(cbind(rownames(borr_model_coef), borr_model_coef, row.names = NULL),
+           c("Attribute", "Coefficients"))
+
+
+borr_model_coef <- borr_model_coef %>% 
+  left_join(dictionary,by = c("Attribute" = "Variable_woe")) %>% 
+  left_join(iv, by = c("Attribute" = "variable_woe"))
+
+borr_model_coef$Coefficients <- round(borr_model_coef$Coefficients,4)
+
+borr_model_coef %>%
+  dplyr::select(Attribute,Coefficients, info_value, Description, Adverse.Actionable, Concept.Type, Attribute.y, WOE_Reviewed) %>% #, Current.Product,ASH4,Category)  %>% 
+  #arrange(Coefficients) %>% 
+  gt() %>% 
+  gt_theme_espn()
+
+
+write.csv(borr_model_coef,"Borr_Model_Coef.csv")
+
+#Model Variables
+model_var <- borr_df %>% 
+  select(CRP02_0119290000,
+CRP02_0119510000,
+CRP02_0117010000,
+CRP02_0119470000,
+CRP02_0123030000,
+CRP02_0119120000,
+CRP02_1104050000,
+CRP02_1101014001,
+TDA35745,
+TDA19625,
+ATTR6049,
+VendorInquiries60Days,
+UniqueMemberInquiries180Days,
+TT_UMINQ730,
+DATAX_HIT,
+Score_5402
+)
+    
+# Correlation Matrix
+cor_matrix <- cor(model_var)
+
+# remove diagonal and redundant values
+cor_matrix[!lower.tri(cor_matrix)] <- NA 
+
+cor_matrix_final <- data.frame(cor_matrix) %>%
+  rownames_to_column() %>%
+  gather(key="variable", value="correlation", -rowname) %>%
+  filter(abs(correlation) > 0.6)
+
+
+```
+
+## Borrower Model Train
+
+Our train set is outperforming ASH4 by AUC
+
+```{r glmnet train, message=FALSE, warning=FALSE, paged.print=TRUE}
+###Train Set
+borr_train_predictions <- predict(borr_glmnet_model, newx = borr_train_x, type = "response", s = lambda)
+
+borr_train_predictions <- cbind(borr_train,borr_train_predictions)
+borr_train_predictions <- borr_train_predictions %>% 
+  mutate(BAD = 1- s1)
+
+borr_train_predictions %>%
+  summarise(
+    Cnt = n(),
+    ASH5EQ = round(auc(borr_train_predictions$Performance, borr_train_predictions$BAD), 
+                   4),
+    ASH5TU = round(auc(borr_train_predictions$Performance, 
+                       borr_train_predictions$ASH5_TU), 4),
+    ASH4TU = round(auc(borr_train_predictions$Performance, 
+                       borr_train_predictions$ASH4_TU), 4),
+    Default_Rate = formattable::percent(mean(Performance)),
+    #Default_Rate_Unaltered = formattable::percent(mean(Old_DV)),
+    ASH5EQ_Default_Rate = formattable::percent(mean(BAD)),
+    ASH5TU_Default_Rate = formattable::percent(mean(ASH5_TU)),
+    ASH4TU_Default_Rate = formattable::percent(mean(ASH4_TU))
+      ) %>%
+  gt() %>%
+  gt_theme_espn() %>%
+  tab_header(title = "Train AUC vs ASH5TU")
+
+
+```
+
+## Borrower Model Test
+
+Our model is under performing ASH4, however, our expected default rate is more closely aligned with actual.
+
+```{r glmnet test}
+borr_test_predictions <- predict(borr_glmnet_model, newx = borr_test_x, type = "response", s = lambda)
+
+borr_test_predictions <- cbind(borr_test,borr_test_predictions)
+borr_test_predictions <- borr_test_predictions %>% 
+  mutate(BAD = 1- s1)
+
+borr_test_predictions %>%
+  summarise(
+    Cnt = n(),
+    ASH5EQ = round(auc(Performance, BAD), 4),
+    ASH5TU = round(auc(Performance, ASH5_TU), 4),
+    ASH4TU = round(auc(Performance, ASH4_TU), 4),
+    Default_Rate = formattable::percent(mean(Performance)),
+    #Default_Rate_Unaltered = formattable::percent(mean(Old_DV)),
+    ASH5EQ_Default_Rate = formattable::percent(mean(BAD)),
+    ASH5TU_Default_Rate = formattable::percent(mean(ASH5_TU)),
+    ASH4TU_Default_Rate = formattable::percent(mean(ASH4_TU))
+      ) %>%
+  gt() %>%
+  gt_theme_espn() %>%
+  tab_header(title = "Test AUC vs ASH5TU")
+
+```
+
+## Borrower Model Holdout
+
+Our model is under performing ASH4, however, our expected default rate is more closely aligned with actual.
+
+```{r glmnet holdout}
+
+borr_holdout_predictions <- predict(borr_glmnet_model, newx = borr_holdout_x, type = "response", s = lambda)
+
+borr_holdout_predictions <- cbind(borr_holdout,borr_holdout_predictions)
+borr_holdout_predictions <- borr_holdout_predictions %>% 
+  mutate(BAD = 1- s1)
+
+borr_holdout_predictions %>%
+  summarise(
+    Cnt = n(),
+    ASH5EQ = round(auc(Performance, BAD), 4),
+    ASH5TU = round(auc(Performance, ASH5_TU), 4),
+    ASH4TU = round(auc(Performance, ASH4_TU), 4),
+    Default_Rate = formattable::percent(mean(Performance)),
+    #Default_Rate_Unaltered = formattable::percent(mean(Old_DV)),
+    ASH5EQ_Default_Rate = formattable::percent(mean(BAD)),
+    ASH5TU_Default_Rate = formattable::percent(mean(ASH5_TU)),
+    ASH4TU_Default_Rate = formattable::percent(mean(ASH4_TU))
+      ) %>%
+  gt() %>%
+  gt_theme_espn() %>%
+  tab_header(title = "Holdout AUC vs ASH5TU")
+
+```
+
+## Borrower Model Evaluation
+
+Overall our model performs slightly better than ASH4 but yet gets our average default rate more closely aligned.
+
+```{r glmet all, paged.print=TRUE}
+##Join Predictions
+borr_all_predictions <- rbind(borr_train_predictions,borr_test_predictions, borr_holdout_predictions)
+
+##Auc
+borr_all_predictions %>%
+  summarise(Cnt = n(),
+    ASH5EQ = round(auc(Performance, BAD), 4),
+    #ASH5_SixScore = .7175,
+    ASH5TU = round(auc(Performance, ASH5_TU), 4),
+    ASH4TU = round(auc(Performance, ASH4_TU), 4),
+    Default_Rate = formattable::percent(mean(Performance)),
+    #Default_Rate_Unaltered = formattable::percent(mean(Old_DV)),
+    ASH5EQ_Default_Rate = formattable::percent(mean(BAD)),
+    ASH5TU_Default_Rate = formattable::percent(mean(ASH5_TU)),
+    ASH4TU_Default_Rate = formattable::percent(mean(ASH4_TU))
+    ) %>%
+  gt() %>%
+  gt_theme_espn() %>%
+  tab_header(title = "ALL AUC")
+
+###ks
+# borr_all_predictions %>% 
+#   summarise(cnt = n(),
+#             ASH5 = round(max(attr(ROCR::performance(prediction(BAD, Performance), "tpr", "fpr"), 'y.values') [[1]] -
+#                  attr(ROCR::performance(prediction(BAD, Performance), "tpr", "fpr"), 'x.values')[[1]]), 4),
+# 
+#             ASH4 = round(max(attr(ROCR::performance(prediction(ASH4_TU, Performance), "tpr", "fpr"), 'y.values') [[1]] -
+#                 attr(ROCR::performance(prediction(ASH4_TU, Performance), "tpr", "fpr"), 'x.values')[[1]]), 4)) %>% 
+#   gt() %>% 
+#   gt_theme_espn() %>% 
+#   tab_header(title = "ALL KS Scores")
+
+
+#PD to Score Conversion
+Base_Points <- 200
+Pts_to_Double_Odds <- 20
+Base_Odds <- 50
+
+borr_all_predictions$ASH5_EQ_Borrower_Score <- (Base_Points - (Pts_to_Double_Odds/log(2))*log(Base_Odds))+(Pts_to_Double_Odds/log(2))*log(1/borr_all_predictions$BAD-1)
+
+borr_all_predictions$ASH5_TU_Borrower_Score <- (Base_Points - (Pts_to_Double_Odds/log(2))*log(Base_Odds))+(Pts_to_Double_Odds/log(2))*log(1/borr_all_predictions$ASH5_TU-1)
+
+borr_all_predictions$ASH4_TU_Borrower_Score <- (Base_Points - (Pts_to_Double_Odds/log(2))*log(Base_Odds))+(Pts_to_Double_Odds/log(2))*log(1/borr_all_predictions$ASH4_TU-1)
+
+# borr_all_predictions$ASH5_Borrower_Grade <-
+#   cut(
+#     borr_all_predictions$ASH5_Borrower_Score,
+#     breaks = c(-Inf, 110, 130, 140, 150, 160, 170, 180, 190, 200, 210, Inf),
+#     labels = c(
+#       "Auto_Decline",
+#       "Grade 10",
+#       "Grade 9",
+#       "Grade 8",
+#       "Grade 7",
+#       "Grade 6",
+#       "Grade 5",
+#       "Grade 4",
+#       "Grade 3",
+#       "Grade 2",
+#       "Grade 1"
+#     ),
+#     include.lowest = TRUE,
+#     right = FALSE
+#   )
+
+# borr_all_predictions$ASH4_TU_Borrower_Grade <-
+#   cut(
+#     borr_all_predictions$ASH4_TU_Borrower_Score,
+#     breaks = c(-Inf, 110, 130, 140, 150, 160, 170, 180, 190, 200, 210, Inf),
+#     labels = c(
+#       "Auto_Decline",
+#       "Grade 10",
+#       "Grade 9",
+#       "Grade 8",
+#       "Grade 7",
+#       "Grade 6",
+#       "Grade 5",
+#       "Grade 4",
+#       "Grade 3",
+#       "Grade 2",
+#       "Grade 1"
+#     ),
+#     include.lowest = TRUE,
+#     right = FALSE
+#   )
+
+
+
+#Histogram of PD
+borr_all_predictions_simple <- borr_all_predictions %>%
+  dplyr::select(ASH5_EQ = BAD, ASH5_TU, ASH4_TU)
+
+borr_all_predictions_simple <- melt(borr_all_predictions_simple)
+
+ggplot(data = borr_all_predictions_simple, aes(x = value, fill = variable))+
+  geom_density(alpha = .25) +
+  scale_x_continuous(labels = scales::percent_format(accuracy = 1L),
+                     limits = c(0, .5))
+
+### Allocation
+# borr_all_predictions %>% 
+#   group_by(ASH5_Borrower_Grade) %>% 
+#   summarise(n = n()) %>% 
+#   mutate(freq = formattable::percent(n/sum(n),2)) %>% 
+#   gt() %>% 
+#   gt_theme_espn() %>% 
+#   tab_header(title = "ASH5 Borrower Grade") %>% 
+# data_color(columns = c(freq), colors = white_green_color_scale)
+# 
+# borr_all_predictions %>% 
+#   group_by(ASH4_TU_Borrower_Grade) %>% 
+#   summarise(n = n()) %>% 
+#   mutate(freq = formattable::percent(n/sum(n),2)) %>% 
+#   gt() %>% 
+#   gt_theme_espn() %>% 
+#   tab_header(title = "ASh4 TU Borrower Grade") %>% 
+#   data_color(columns = c(freq), colors = white_green_color_scale)
+
+#Month Preds
+borr_all_predictions_month <- borr_all_predictions %>%
+  group_by(Month) %>%
+  summarise(cnt = n(), 
+            ASH5_EQ = mean(BAD), 
+            Actual_Modified_DV = mean(Performance), 
+            ASH5_TU = mean(ASH5_TU),
+            ASH4_TU = mean(ASH4_TU), 
+            #Actual = mean(Old_DV), 
+            )
+
+##PLOT MONTHLY
+ggplotly(ggplot(data =  borr_all_predictions_month, aes(x = Month)) +
+  #geom_line(aes(y = Actual, color = "Actual"), size = 1) +
+  geom_line(aes(y = ASH5_EQ, color = "ASH5_EQ"),  size = 2) +
+  geom_line(aes(y = Actual_Modified_DV, color = "Actual_Modified_DV"),  size = 2) +
+  geom_line(aes(y = ASH5_TU, color = "ASH5_TU"), size = 2, linetype = "dotted") +  
+  geom_line(aes(y = ASH4_TU, color = "ASH4_TU"), size = 1, linetype = "dashed") +
+   scale_color_manual(name = "Models",
+       values = c(#"Actual" = "Green",
+       "ASH5_EQ" = "orange",
+       "ASH5_TU" = "blue",
+       "ASH4_TU" = "red",
+       "Actual_Modified_DV" = "Dark Green"))+
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 90)) +
+  labs(title = "Month Prediction vs Actual") +
+  xlab("App_Month") +
+  ylab("24Mo Performance") +
+  scale_x_date(date_breaks = "months", date_labels = "%b-%y") +
+  scale_y_continuous(labels = scales::percent, limits = c(0,.15)))
+
+
+ggplot(data = borr_all_predictions %>%
+         filter(ASH5_TU != "NA" & BAD != "NA"),
+                aes(x = BAD, y = ASH5_TU))+
+  geom_point(alpha = 1/20, color = "dark green")  + 
+  xlab("ASH5 EQ") +
+  ylab("ASH5 TU") +
+  labs(title="ASH5 EQ vs ASH5 TU scores") +
+  scale_x_continuous(limits=c(0,.4)) + 
+  scale_y_continuous(limits=c(0,.4)) +
+  geom_abline(slope = 1)
+  #scale_x_continuous(limits = c(0,.5))
+
+
+
+#ggplotly(
+  ggplot(
+    data = borr_all_predictions %>%
+      group_by(Pred_bin = #case_when(eads52pr_std205 >= 0 ~ 1, TRUE ~0)) %>%
+                 
+      #cut_width(evtg04_finscore,20, boundary = 0)) %>%
+         #cut(Score_5402, c(-Inf,5,540,560,580,590,600,620,640,660,680,700,750,Inf))) %>%
+        #cut(Score_2354_1, c(-Inf,400,540,580,600,620,640,660,680,720,760,800,Inf))) %>% 
+      #CRP02_0119010000) %>% 
+        DATAX_HIT) %>% 
+        #cut(Income, c(-Inf,2000,3000,4000,5000,6000,7000,Inf))) %>% 
+        #cut(Residence.Time , c(-Inf,12,24,36,48,60,120,240,360,Inf))) %>% 
+      #cut(CRP02_0119290000, c(-Inf,12,18,24,36,48,60,84,120,992,Inf))) %>% 
+      #cut(CRP02_0119510000, c(-Inf,12,24,36,48,60,72,992,Inf))) %>% 
+      #cut(CRP02_0106460000, c(-Inf,2,12,992,Inf))) %>% 
+      #cut(CRP02_0117010000, c(-Inf,6,12,24,36,60,992,Inf))) %>% 
+      #cut(CRP02_0119470000, c(-Inf,12,24,36,48,60,90,120,180,992,Inf))) %>% 
+      #cut(CRP02_0123030000, c(-Inf,12,24,36,48,60,72,992,Inf))) %>% 
+      #cut(CRP02_0119120000, c(-Inf,12,24,48,72,120,992,Inf))) %>% 
+      #cut(CRP02_0501458000, c(-Inf,0.01,0.2,0.4,0.6,0.8,0.95,1,9,Inf))) %>% 
+      #cut(CRP02_1104050000, c(-Inf,120,992,Inf))) %>% 
+      #cut(CRP02_1101014001, c(-Inf,8,92,Inf))) %>% 
+      #cut(TDA35745, c(-Inf, 100, 0, 1, 992, Inf))) %>%
+      #cut(ATTR6003, c(-Inf,1,500,1000,2000,5000,Inf))) %>%
+      #cut(TDA19625, c(-Inf,1,20,40,60,80,95,100,105,992,Inf))) %>% 
+      #cut(ATTR6049, c(-Inf,1,500,1000,2000,5000,10000,20000,50000,Inf))) %>% 
+      #cut(VendorInquiries60Days, c(-Inf,1,2,Inf))) %>% 
+      #cut(UniqueMemberInquiries180Days, c(-Inf,1,2,3,Inf))) %>% 
+      #cut(TT_INQALL24, c(-Inf,1,3,5,7,Inf))) %>% 
+      #cut(TT_OMINQ730, c(-Inf,1,3,5,7,Inf))) %>% 
+      #cut(TT_UMINQ730, c(-Inf,1,2,3,4,Inf))) %>% 
+      #cut(Employment_Months, c(-Inf,6,12,24,36,60,120,240,Inf))) %>% 
+      summarise(
+        cnt = n(),
+        ASH5_EQ = mean(BAD),
+        Actual = mean(Performance),
+        ASH5_TU = mean(ASH5_TU),
+        ASH4_TU = mean(ASH4_TU)) %>%
+      filter(cnt > 100),
+    aes(x = ASH5_EQ, y = Actual, label = Pred_bin)) +
+    geom_point(aes(size = cnt)) +
+    geom_text(aes(label =  Pred_bin), hjust = -1,vjust = 1,check_overlap = TRUE,size = 3) +
+    scale_x_continuous( labels = scales::percent_format(accuracy = 1L), limits = c(0, .3)) +
+    scale_y_continuous( labels = scales::percent_format(accuracy = 1L), limits = c(0, .3)) +
+    geom_abline(aes(intercept = 0, slope = 1)) +
+    theme_minimal() +
+    ggtitle("Modeled Losses vs Actual")
+    #)
+
+
+
+```
+
+##Score Borrowers 2018-2019
+
+```{r old_borrowers, include=FALSE}
+
+borr_apps_x <- borr_apps_x %>% 
+  as.data.frame() %>% 
+  dplyr::select(-c(`State ME `,`State PR `,`State RI `,`State Tx `,`State GU `, `State MD `, `State NULL `, Old_DV)) %>% 
+  as.matrix()
+
+# borr_apps_x_df <- borr_apps_x %>%
+#   as.data.frame()
+# 
+# borr_train_x_df <- borr_train_x %>%
+# as.data.frame()
+
+borr_apps_predictions <- predict(borr_glmnet_model, newx = borr_apps_x, type = "response", s = lambda)
+
+borr_apps_predictions <- borr_apps_predictions %>%
+  as.data.frame() %>% 
+  mutate(ASH5 = 1- s1)
+
+borr_apps_predictions <- cbind(borr_df_apps,borr_apps_predictions)
+
+borr_apps_predictions_simple <- borr_apps_predictions %>% 
+  select(APP_NUM,Borrower,ASH5, ASH4_TU)
+
+borr_apps_predictions_simple$ASH5_Borrower_Score <- (Base_Points - (Pts_to_Double_Odds/log(2))*log(Base_Odds))+(Pts_to_Double_Odds/log(2))*log(1/borr_apps_predictions$ASH5-1)
+
+
+borr_apps_predictions_simple$ASH5_Borrower_Grade <-
+  cut(
+    borr_apps_predictions_simple$ASH5_Borrower_Score,
+    breaks = c(-Inf, 110, 130, 140, 150, 160, 170, 180, 190, 200, 210, Inf),
+    labels = c(
+      "Auto_Decline",
+      "Grade 10",
+      "Grade 9",
+      "Grade 8",
+      "Grade 7",
+      "Grade 6",
+      "Grade 5",
+      "Grade 4",
+      "Grade 3",
+      "Grade 2",
+      "Grade 1"
+    ),
+    include.lowest = TRUE,
+    right = FALSE
+  )
+
+borr_apps_predictions_simple <- sqldf("Select
+ba.*,
+bap.BAD 'Funded_ASH5'
+                               from borr_apps_predictions_simple ba
+                               left join borr_all_predictions bap on bap.APP_NUM = ba.APP_NUM 
+                               and bap.Borrower = ba.Borrower")
+
+#write.csv(borr_apps_predictions_simple ,"ASH5_Scores_Apps.csv", row.names = TRUE)
+
+
+```
+
+## LSA Evaluation
+
+```{r LSA_borrower, message=FALSE, warning=FALSE}
+LSA_df <- read.csv("LSA_DATA.csv")
+
+LSA_df <- LSA_df %>%
+mutate(APP_NUM = ï..APP_NUM)
+
+LSA_df <- dplyr::left_join(LSA_df, ASH5_TU_Super8, by = c('APP_NUM' = 'customerInput_scorereference', 'Borrower'='Borrower'))
+
+
+
+LSA_df$LSA_COF <- as.numeric(LSA_df$LSA_COF)
+
+LSA_df <- sqldf("Select lsa.*, bs.ASH5, bs.ASH4_TU
+                from LSA_df lsa
+                left join borr_apps_predictions_simple  bs on bs.APP_NUM = lsa.APP_NUM
+                and bs.Borrower = lsa.Borrower" )
+
+
+# LSA_df <- sqldf("Select lsa.*
+#                 from LSA_df lsa
+#                 left join borr_df_apps  bs on bs.APP_NUM = lsa.APP_NUM 
+#                 and bs.Borrower = lsa.Borrower" )
+
+LSA_df <- LSA_df %>% 
+  distinct()
+ 
+
+LSA_df %>% 
+  filter(LSA == 1) %>% 
+  filter(ASH5 <= 1) %>% 
+  #group_by(CREDIT_STATUS, FUNDED) %>% 
+  #group_by(bin = cut(evtg04_finscore, breaks = c(0,20,500,580,680))) %>% 
+  summarise(Borrowers = n(), 
+            ASH5EQ_AUC = round(auc(LSA_COF,ASH5),4), 
+            ASH5TU_AUC = round(auc(LSA_COF, ASH5_TU),4),
+            ASH4TU_AUC = round(auc(LSA_COF, ASH4_TU),4)) %>% 
+  gt() %>% 
+  gt_theme_espn() %>% 
+  tab_header(title="LSA Performance using LSA defined 'Bad'")
+
+
+LSA_df %>% 
+  filter(LSA == 1) %>%
+   filter(ASH5 <= 1) %>% 
+  #group_by(bin = cut(evtg04_finscore, breaks = c(0,20,500,560,580,600,620,640,680,720))) %>% 
+  summarise(borrowers = n(), 
+            ASH5EQ = formattable::percent(mean(ASH5)),
+            ASH5TU = formattable::percent(mean(ASH5_TU)), 
+            ASH4TU = formattable::percent(mean(ASH4_TU)),
+            LSA = formattable::percent(mean(LSA_COF))) %>% 
+  gt() %>% 
+  gt_theme_espn() %>% 
+  summary_rows(columns = c(ASH5EQ, ASH5TU, ASH4TU, LSA),
+               fns = list(avg = "mean"),
+               formatter = fmt_percent) %>%
+  data_color(columns = c(borrowers), colors = white_green_color_scale) %>% 
+  data_color(vars(ASH5EQ, ASH5TU, ASH4TU, LSA), colors = scales::col_numeric(palette = c("green", "white", "red"),
+                                 domain = c(0, 0.3))) %>% 
+  tab_header(title = "LSA vs ASH5 EQ, ASH5 TU, and ASH4 TU predicted default rates by VantageScore Bins",
+             subtitle = "ASH and LSA have different definitions of COF")
+  
+# 
+# library(kableExtra)  
+# 
+# ###LSA Performance on Funded vs not funded
+# LSA_df  %>%
+#   filter (LSA == 1) %>%
+#   mutate(FUNDED = case_when(FUNDED == 1 ~ "FOURSIGHT",
+#                              TRUE ~ "NOT_FOURSIGHT")) %>% 
+#   group_by(FUNDED) %>%
+#   summarise(Count = n(), LSA_COF = formattable::percent(mean(LSA_COF, na.rm = TRUE))) %>%
+#   pivot_wider(names_from = FUNDED,
+#               values_from = c(Count, LSA_COF)) %>%
+#   kable()
+# 
+# 
+# #Declined vs Non-Declined
+# LSA_df  %>%
+#   #filter (LSA == 1) %>%
+#   mutate(DECLINED = case_when(CREDIT_STATUS == "Declined" ~ "Declined",
+#                               TRUE ~ "NON-DECLINED")) %>%
+#   group_by(DECLINED) %>%
+#   summarise(Count = n(), LSA_COF = formattable::percent(mean(LSA_COF, na.rm = TRUE))) %>%
+#   #mutate(freq = formattable::percent(Count/sum(Count))) %>%
+#   pivot_wider(names_from = DECLINED,
+#               values_from = c(Count, LSA_COF)) %>%
+#   kable() 
+# 
+# 
+# #Capture Rate
+# LSA_df  %>%
+#   filter (CREDIT_STATUS == "Approved") %>%
+#   mutate(FUNDED = case_when(FUNDED == 1 ~ "FOURSIGHT",
+#                              TRUE ~ "NOT_FOURSIGHT")) %>%
+#   group_by(FUNDED) %>%
+#   summarise(Count = n(), LSA_COF = formattable::percent(mean(LSA_COF, na.rm = TRUE))) %>%
+#   #mutate(freq = formattable::percent(Count/sum(Count))) %>%
+#   pivot_wider(names_from = FUNDED,
+#               values_from = c(Count, LSA_COF)) %>%
+#   kable() 
+
+
+LSA_df_train <- dplyr::left_join(LSA_df, borr_df_apps, by = c('APP_NUM' = 'APP_NUM', 'Borrower'='Borrower'))
+
+LSA_df_woe_train <- LSA_df_train %>% 
+  filter (LSA == 1) %>% 
+  filter(!is.na(customerInput_foursighttarget))
+
+
+LSA_df_woe_train$Performance_factor <- as.factor(LSA_df_woe_train$LSA_COF)
+LSA_df_woe_train$Performance_factor <-
+  ifelse(LSA_df_woe_train$Performance_factor == 1, "BAD", "GOOD")
+LSA_df_woe_train$Performance_factor <- as.factor(LSA_df_woe_train$Performance_factor)
+
+
+borr_lsa_woe_bins <- woebin(LSA_df_woe_train,
+                        y="Performance_factor",
+                        x = col_names,
+                        positive = "BAD",
+                        breaks_list = borr_woe_breaks_list,
+                        # special_values = borr_woe_special_values,
+                        no_cores = 4, count_distr_limit = .01)
+
+
+
+woebin_plot(borr_lsa_woe_bins$Score_5402,  show_barval = FALSE)
+
+
+xyz_lsa <- borr_lsa_woe_bins$Score_5402
+
+write.csv(xyz_lsa,'xyz_lsa.csv')
+
+
+
+
+```
+
+
+# Risk Model {.tabset}
+
+**Objective:** Predict the risk of each application when applying for an auto loan with Foursight Capital. We are specifically targeting whether a loan defaults in the first 24 months of the life of the loan. Due to the macroeconomic effects starting in the Spring of 2020 due to COVID-19, we have found the need to artificially change the target variable for some loans.
+
+**Data Used:** Using funded loans with an application date between 2018 and July 2019. In total we have close to 26,000 loans. For the Risk model we are using the output of the borrower model, which is the probability of default, as one of our predictive variables. We join that variable with variables pertaining to loan structure, affordability, collateral, geography, borrower relationships (e.g living at same address and income difference), and others.
+
+## Load Data and Clean
+
+Load in the data from a csv file. Join in the Borrower PD, and borrower scores.
+
+```{r LOAD_DATA}
+risk_df <- read.csv("Risk_Model_Data.csv")
+
+## We have a few duplicates from the query. This strips them out
+risk_df <- risk_df %>% 
+  distinct()
+
+##Add in Pri Borr PD
+risk_df <- risk_df %>% 
+   left_join(select(borr_all_predictions %>% filter(Borrower == "P") %>% 
+                      select(customerInput_scorereference, BAD, Income, ASH5_Borrower_Score), 
+                    customerInput_scorereference, BAD, Income,ASH5_Borrower_Score), 
+             by = c("XLOAN_NUM" = "customerInput_scorereference")) %>% 
+  rename("PRI_BORR_PD" = "BAD", "PRI_INCOME" = "Income", "PRI_ASH5_SCORE" = "ASH5_Borrower_Score")
+
+##Add in Sec Borr PD
+risk_df <- risk_df %>% 
+   left_join(select(borr_all_predictions %>% filter(Borrower == "S") %>% 
+                      select(customerInput_scorereference, BAD, Income, ASH5_Borrower_Score), 
+                    customerInput_scorereference, BAD, Income, ASH5_Borrower_Score), 
+             by = c("XLOAN_NUM" = "customerInput_scorereference")) %>% 
+  rename("SEC_BORR_PD" = "BAD", "SEC_INCOME" = "Income", "SEC_ASH5_SCORE" = "ASH5_Borrower_Score")
+
+### We have 28 missing scores. Not sure why
+risk_df <- risk_df %>% 
+  filter(PRI_BORR_PD != "NA")
+
+##Create Borr_PD_AVG and BORR_PD_WAINCOME
+borr_scores <- risk_df %>% 
+  rowwise() %>% 
+  mutate(BORR_PD_AVG = mean(c(PRI_BORR_PD, SEC_BORR_PD), na.rm = T),
+         BORR_PD_WAINCOME = case_when(is.na(SEC_BORR_PD) ~ PRI_BORR_PD,
+                            TRUE ~ ((PRI_BORR_PD * PRI_INCOME) + (SEC_BORR_PD * SEC_INCOME)) / (PRI_INCOME + SEC_INCOME)),
+         BORR_SCORE = mean(c(PRI_ASH5_SCORE, SEC_ASH5_SCORE), na.rm = T)) %>%
+  select(XLOAN_NUM, BORROWER_COUNT, PRI_BORR_PD, SEC_BORR_PD, BORR_PD_AVG, PRI_INCOME, SEC_INCOME, 
+         BORR_PD_WAINCOME, PRI_ASH5_SCORE, SEC_ASH5_SCORE, BORR_SCORE)
+
+## Join into table
+risk_df <- sqldf("Select dr.*,
+bs.BORR_PD_AVG,
+bs.BORR_PD_WAINCOME,
+bs.BORR_SCORE
+                 from risk_df dr
+                 left join borr_scores bs on bs.XLOAN_NUM = dr.XLOAN_NUM")
+
+risk_df$ASH5_Borrower_Grade <-
+  cut(
+    risk_df$BORR_SCORE,
+    breaks = c(-Inf, 110, 130, 140, 150, 160, 170, 180, 190, 200, 210, Inf),
+    labels = c(
+      "Auto_Decline",
+      "Grade 10",
+      "Grade 9",
+      "Grade 8",
+      "Grade 7",
+      "Grade 6",
+      "Grade 5",
+      "Grade 4",
+      "Grade 3",
+      "Grade 2",
+      "Grade 1"
+    ),
+    include.lowest = TRUE,
+    right = FALSE
+  )
+
+
+risk_df$Performance_factor <- as.factor(risk_df$New_DV)
+risk_df$Performance_factor <- ifelse(risk_df$Performance_factor == 1, "BAD","GOOD")
+risk_df$Performance_factor<- as.factor(risk_df$Performance_factor)
+risk_df$Application_Month <- as.Date(risk_df$Application_Month,"%m/%d/%Y")
+
+##Bring this back in
+# risk_apps_recent <- apps_recent
+# 
+# risk_apps_recent <- risk_apps_recent %>% 
+#   rowwise() %>% 
+#   mutate(BORR_PD_WAINCOME = case_when(is.na(SEC_BORR_PD) ~ PRI_BORR_PD,
+#                             TRUE ~ ((PRI_BORR_PD * PRI_INCOME) + (SEC_BORR_PD * SEC_INCOME)) / (PRI_INCOME + SEC_INCOME))) 
+# 
+# risk_apps_recent <- risk_apps_recent %>% 
+#   mutate(BORR_SCORE = BORR_SCORE_AVG,
+#          MERCHANT_CATEGORY = case_when(MERCHANT_CATEGORY == "Direct partners" ~ "Direct",
+#                                              MERCHANT_CATEGORY == "Rateworks" ~ "Direct",
+#                                        MERCHANT_CATEGORY == "Franchise" ~ "Franchise",
+#                                        MERCHANT_CATEGORY == "Independent" ~ "Independent"))
+
+
+
+```
+
+## Variable Creation
+
+Creating binned variables, binary variables, and others based on patterns and relationships we are seeing in the data.
+
+```{r BINNING, include=FALSE}
+#BINNING
+##FLTVR
+risk_df$FLTVR_BIN <-
+  cut(
+    risk_df$FLTVR,
+    breaks = c(-Inf, 80, 90, 100, 110,115, Inf),
+    include.lowest = TRUE,
+    right = FALSE
+  )
+
+# risk_apps_recent$FLTVR_BIN <-
+#   cut(
+#     risk_apps_recent$FLTVR,
+#     breaks = c(-Inf, 80, 90, 100, 110,115, Inf),
+#     include.lowest = TRUE,
+#     right = FALSE
+#   )
+###LTVR
+risk_df$LTVR_BIN <-
+  cut(
+    risk_df$LTVR,
+    breaks = c(-Inf, 70, 85, 100, 115, 130, 145, Inf),
+    include.lowest = TRUE,
+    right = FALSE
+  )
+
+risk_df$LTVR_BIN2 <-
+  cut(
+    risk_df$LTVR,
+    breaks = c(-Inf, 100 ,130, Inf),
+    include.lowest = TRUE,
+    right = FALSE
+  )
+
+# risk_apps_recent$LTVR_BIN <-
+#   cut(
+#     risk_apps_recent$LTVR,
+#     breaks = c(-Inf, 70, 85, 100, 115, 130, 145, Inf),
+#     include.lowest = TRUE,
+#     right = FALSE
+#   )
+
+# risk_apps_recent$LTVR_BIN2 <-
+#   cut(
+#     risk_apps_recent$LTVR,
+#     breaks = c(-Inf, 100 ,130, Inf),
+#     include.lowest = TRUE,
+#     right = FALSE
+#   )
+
+####PTI
+risk_df$PTI_BIN <-
+  cut(
+    risk_df$DEC_PAYMENT_TO_INCOME,
+    breaks = c(-Inf, 2, 4, 6, 8, 10, 12, 14, Inf),
+    include.lowest = TRUE,
+    right = FALSE
+  )
+
+risk_df$PTI_BIN2 <-
+  cut(
+    risk_df$DEC_PAYMENT_TO_INCOME,
+    breaks = c(-Inf, 4, 8, 12, Inf),
+    include.lowest = TRUE,
+    right = FALSE
+  )
+
+# risk_apps_recent$PTI_BIN <-
+#   cut(
+#     risk_apps_recent$DEC_PAYMENT_TO_INCOME,
+#     breaks = c(-Inf, 2, 4, 6, 8, 10, 12, 14, Inf),
+#     include.lowest = TRUE,
+#     right = FALSE
+#   )
+# 
+# risk_apps_recent$PTI_BIN2 <-
+#   cut(
+#     risk_apps_recent$DEC_PAYMENT_TO_INCOME,
+#     breaks = c(-Inf, 4, 8, 12, Inf),
+#     include.lowest = TRUE,
+#     right = FALSE
+#   )
+
+###BORR PD AVG
+risk_df$BORR_PD_AVG_BIN <-
+  cut(
+    risk_df$BORR_PD_AVG,
+    breaks = c(-Inf, .02, .04, .06, .07, .08, .1, .11, .12, .14, .16, .18, .2, .24, .28, .32, Inf),
+    include.lowest = TRUE,
+    right = FALSE
+  )
+
+# risk_apps_recent$BORR_PD_AVG_BIN <-
+#   cut(
+#     risk_apps_recent$BORR_PD_AVG,
+#     breaks = c(-Inf, .02, .04, .06, .07, .08, .1, .11, .12, .14, .16, .18, .2, .24, .28, .32, Inf),
+#     include.lowest = TRUE,
+#     right = FALSE
+#   )
+
+####Total Down %
+risk_df$TOTAL_DOWN_CONTRACT_PERCENT_BIN <-
+  cut(
+    risk_df$TOTAL_DOWN_CONTRACT_PERCENT,
+    breaks = c(-Inf, 5, 10, 20, 30, 40, Inf),
+    include.lowest = TRUE,
+    right = FALSE
+  )
+# risk_apps_recent$TOTAL_DOWN_CONTRACT_PERCENT_BIN <-
+#   cut(
+#     risk_apps_recent$TOTAL_DOWN_CONTRACT_PERCENT,
+#     breaks = c(-Inf, 5, 10, 20, 30, 40, Inf),
+#     include.lowest = TRUE,
+#     right = FALSE
+#   )
+
+####Mileage
+risk_df$Mileage_bin <-
+  cut(risk_df$VEHICLE_MILEAGE,
+      breaks = c(-Inf,500,5000,50000, Inf),
+      include.lowest =  TRUE,
+      right = FALSE)
+# risk_apps_recent$Mileage_bin <-
+#   cut(risk_apps_recent$VEHICLE_MILEAGE,
+#       breaks = c(-Inf,500,5000,50000, Inf),
+#       include.lowest =  TRUE,
+#       right = FALSE)
+
+##LTVR BELOW 95
+risk_df$LTVR_below_95 <-
+  cut(risk_df$LTVR,
+      breaks = c(-Inf,95,Inf),
+      include.lowest =  TRUE,
+      right = FALSE)
+# risk_apps_recent$LTVR_below_95 <-
+#   cut(risk_apps_recent$LTVR,
+#       breaks = c(-Inf,95,Inf),
+#       include.lowest =  TRUE,
+#       right = FALSE)
+
+###Age Bin
+risk_df$Vehicle_age_bin <-
+  cut(risk_df$VEHICLE_AGE_AT_PURCHASE,
+      breaks = c(-Inf,0,1,Inf),
+      include.lowest =  TRUE,
+      right = FALSE)
+
+# risk_apps_recent$Vehicle_age_bin <-
+#   cut(risk_apps_recent$VEHICLE_AGE_AT_PURCHASE,
+#       breaks = c(-Inf,0,1,Inf),
+#       include.lowest =  TRUE,
+#       right = FALSE)
+
+
+####
+risk_df<- risk_df %>% 
+  mutate(DODGE_MITSUBISHI = case_when(VEHICLE_MAKE_CLEAN == "DODGE" ~1,
+                                      VEHICLE_MAKE_CLEAN == "MITSUBISHI" ~1,
+                                      TRUE ~ 0),
+         PRIME_NEAR_GRADE_LTVR = case_when(CREDIT_SCORE_AVG_CALC >= 620 ~ LTVR),
+         SUB_GRADE_LTVR = case_when(CREDIT_SCORE_AVG_CALC < 620 | is.na(CREDIT_SCORE_AVG_CALC) ~ LTVR),
+         PRIME_NEAR_GRADE_PTI = case_when(CREDIT_SCORE_AVG_CALC >= 620 ~ DEC_PAYMENT_TO_INCOME),
+         SUB_GRADE_PTI = case_when(CREDIT_SCORE_AVG_CALC < 620 | is.na(CREDIT_SCORE_AVG_CALC) ~ DEC_PAYMENT_TO_INCOME),
+         PRIME_NEAR_GRADE_CASH_DOWN = case_when(CREDIT_SCORE_AVG_CALC >= 620 ~ CASH_DOWN_CONTRACT_PERCENT),
+         SUB_GRADE_CASH_DOWN = case_when(CREDIT_SCORE_AVG_CALC < 620 | is.na(CREDIT_SCORE_AVG_CALC) ~ CASH_DOWN_CONTRACT_PERCENT),
+         PRIME_NEAR_GRADE_TOTAL_DOWN = case_when(CREDIT_SCORE_AVG_CALC >= 620 ~ TOTAL_DOWN_CONTRACT_PERCENT),
+         SUB_GRADE_TOTAL_DOWN = case_when(CREDIT_SCORE_AVG_CALC < 620 | is.na(CREDIT_SCORE_AVG_CALC) ~ TOTAL_DOWN_CONTRACT_PERCENT),
+         SUB_LTVR_130_PLUS = case_when(CREDIT_SCORE_AVG_CALC < 620 | is.na(CREDIT_SCORE_AVG_CALC) & LTVR >= 130 ~ 1, TRUE ~0),
+         SUB_CASH_DOWN_10_PCT_LESS = case_when(CREDIT_SCORE_AVG_CALC < 620 | is.na(CREDIT_SCORE_AVG_CALC)
+                                              & CASH_DOWN_CONTRACT_PERCENT < 10 ~ 1, TRUE ~ 0),
+         SUB_NO_TRADE = case_when(CREDIT_SCORE_AVG_CALC < 620 | is.na(CREDIT_SCORE_AVG_CALC) & TRADEIN == 0 ~ 1, TRUE ~ 0),
+         CASH_DOWN_5_PCT_LESS = case_when(CASH_DOWN_CONTRACT_PERCENT < 5 ~ 1, TRUE ~ 0),
+         CASH_DOWN_20_PCT_PLUS = case_when(CASH_DOWN_CONTRACT_PERCENT >= 20 ~ 1, TRUE ~0),
+         TOTAL_DOWN_5_PCT_LESS = case_when(TOTAL_DOWN_CONTRACT_PERCENT < 5 ~ 1, TRUE ~ 0),
+         TOTAL_DOWN_20_PCT_PLUS = case_when(TOTAL_DOWN_CONTRACT_PERCENT >= 20 ~ 1, TRUE ~ 0),
+         MILEAGE_5000_LESS = case_when(VEHICLE_MILEAGE < 5000 ~ 1, TRUE ~ 0),
+         PTI_15_PLUS = case_when(DEC_PAYMENT_TO_INCOME >= 15 ~ 1, TRUE ~ 0),
+         BORR_PD_LTVR_INTERACTION = BORR_PD_AVG * LTVR,
+         BORR_PD_PTI_INTERACTION = BORR_PD_AVG * DEC_PAYMENT_TO_INCOME,
+         BORR_PD_FLTVR_INTERACTION = BORR_PD_AVG * FLTVR,
+         BACK_END = LTVR-FLTVR,
+         BORR_PD_BACK_END_INTERACTION = BORR_PD_AVG * (LTVR-FLTVR),
+         BORR_PD_LTVR_PTI_INTERACTION = BORR_PD_AVG * LTVR * DEC_PAYMENT_TO_INCOME,
+         BORR_PD_FLTVR_PTI_INTERACTION = BORR_PD_AVG * FLTVR * DEC_PAYMENT_TO_INCOME,
+         TRADEIN_CASH_DOWN = case_when(TRADEIN == 1 & CASH_DOWN == 1 ~1,TRUE ~0),
+         CASH_DOWN_NO_TRADE = case_when(CASH_DOWN == 1 & TRADEIN == 0 ~ 1, TRUE ~ 0),
+         TRADEIN_NO_CASH_DOWN = case_when(TRADEIN == 1 & CASH_DOWN == 0 ~ 1, TRUE ~0),
+         LTVR_PTI_INTERACTION = LTVR * DEC_PAYMENT_TO_INCOME,
+         BORR_PD_AVG_15_PLUS = case_when(BORR_PD_AVG >= .15 ~1, TRUE ~ 0),
+         BORR_PD_AVG_16_PLUS = case_when(BORR_PD_AVG >= .16 ~1, TRUE ~ 0),
+         BORR_PD_AVG_18_PLUS = case_when(BORR_PD_AVG >= .18 ~1, TRUE ~ 0),
+         BORR_PD_AVG_20_PLUS = case_when(BORR_PD_AVG >= .2 ~1, TRUE ~ 0),
+         BORR_PD_AVG_SQRT = sqrt(BORR_PD_AVG),
+         BORR_PD_AVG_SQUARE = BORR_PD_AVG^2,
+         BORR_SCORE_110_140 = case_when(BORR_SCORE >= 110 & BORR_SCORE < 140 ~ 1, TRUE ~ 0),
+         TIER_GRADE = case_when(CREDIT_SCORE_AVG_CALC >= 620 ~ "PRIME_NEAR",
+                                CREDIT_SCORE_AVG_CALC < 620 ~ "SUB",
+                                is.na(CREDIT_SCORE_AVG_CALC) ~ "SUB"))
+
+risk_df <- risk_df %>% 
+  unite(TIER_LTVR, TIER_GRADE, LTVR_BIN2, sep = "_", remove = FALSE) %>% 
+  unite(TIER_PTI, TIER_GRADE, PTI_BIN2, sep = "_", remove = FALSE) %>% 
+  unite(TIER_MERCHANT_CATEGORY, TIER_GRADE, MERCHANT_CATEGORY, sep = "_", remove = FALSE)
+
+
+
+# risk_apps_recent <- risk_apps_recent %>% 
+#   mutate(DODGE_MITSUBISHI = case_when(VEHICLE_MAKE_CLEAN == "DODGE" ~1,
+#                                       VEHICLE_MAKE_CLEAN == "MITSUBISHI" ~1,
+#                                       TRUE ~ 0),
+#          PRIME_NEAR_GRADE_LTVR = case_when(CREDIT_SCORE_AVG_OVERALL_CALC >= 620 ~ LTVR),
+#          SUB_GRADE_LTVR = case_when(CREDIT_SCORE_AVG_OVERALL_CALC < 620 | is.na(CREDIT_SCORE_AVG_OVERALL_CALC) ~ LTVR),
+#          PRIME_NEAR_GRADE_PTI = case_when(CREDIT_SCORE_AVG_OVERALL_CALC >= 620 ~ DEC_PAYMENT_TO_INCOME),
+#          SUB_GRADE_PTI = case_when(CREDIT_SCORE_AVG_OVERALL_CALC < 620 | is.na(CREDIT_SCORE_AVG_OVERALL_CALC) ~ DEC_PAYMENT_TO_INCOME),
+#          PRIME_NEAR_GRADE_CASH_DOWN = case_when(CREDIT_SCORE_AVG_OVERALL_CALC >= 620 ~ CASH_DOWN_CONTRACT_PERCENT),
+#          SUB_GRADE_CASH_DOWN = case_when(CREDIT_SCORE_AVG_OVERALL_CALC < 620 | is.na(CREDIT_SCORE_AVG_OVERALL_CALC) ~ CASH_DOWN_CONTRACT_PERCENT),
+#          PRIME_NEAR_GRADE_TOTAL_DOWN = case_when(CREDIT_SCORE_AVG_OVERALL_CALC >= 620 ~ TOTAL_DOWN_CONTRACT_PERCENT),
+#          SUB_GRADE_TOTAL_DOWN = case_when(CREDIT_SCORE_AVG_OVERALL_CALC < 620 | is.na(CREDIT_SCORE_AVG_OVERALL_CALC) ~ TOTAL_DOWN_CONTRACT_PERCENT),
+#          SUB_LTVR_130_PLUS = case_when(CREDIT_SCORE_AVG_OVERALL_CALC < 620 | is.na(CREDIT_SCORE_AVG_OVERALL_CALC) & LTVR >= 130 ~ 1, TRUE ~0),
+#          SUB_CASH_DOWN_10_PCT_LESS = case_when(CREDIT_SCORE_AVG_OVERALL_CALC < 620 | is.na(CREDIT_SCORE_AVG_OVERALL_CALC)
+#                                               & CASH_DOWN_CONTRACT_PERCENT < 10 ~ 1, TRUE ~ 0),
+#          SUB_NO_TRADE = case_when(CREDIT_SCORE_AVG_OVERALL_CALC < 620 | is.na(CREDIT_SCORE_AVG_OVERALL_CALC) & TRADEIN == 0 ~ 1, TRUE ~ 0),
+#          CASH_DOWN_5_PCT_LESS = case_when(CASH_DOWN_CONTRACT_PERCENT < 5 ~ 1, TRUE ~ 0),
+#          CASH_DOWN_20_PCT_PLUS = case_when(CASH_DOWN_CONTRACT_PERCENT >= 20 ~ 1, TRUE ~0),
+#          TOTAL_DOWN_5_PCT_LESS = case_when(TOTAL_DOWN_CONTRACT_PERCENT < 5 ~ 1, TRUE ~ 0),
+#          TOTAL_DOWN_20_PCT_PLUS = case_when(TOTAL_DOWN_CONTRACT_PERCENT >= 20 ~ 1, TRUE ~ 0),
+#          MILEAGE_5000_LESS = case_when(VEHICLE_MILEAGE < 5000 ~ 1, TRUE ~ 0),
+#          PTI_15_PLUS = case_when(DEC_PAYMENT_TO_INCOME >= 15 ~ 1, TRUE ~ 0),
+#          BORR_PD_LTVR_INTERACTION = BORR_PD_AVG * LTVR,
+#          BORR_PD_PTI_INTERACTION = BORR_PD_AVG * DEC_PAYMENT_TO_INCOME,
+#          BORR_PD_FLTVR_INTERACTION = BORR_PD_AVG * FLTVR,
+#          BACK_END = LTVR-FLTVR,
+#          BORR_PD_BACK_END_INTERACTION = BORR_PD_AVG * (LTVR-FLTVR),
+#          BORR_PD_LTVR_PTI_INTERACTION = BORR_PD_AVG * LTVR * DEC_PAYMENT_TO_INCOME,
+#          BORR_PD_FLTVR_PTI_INTERACTION = BORR_PD_AVG * FLTVR * DEC_PAYMENT_TO_INCOME,
+#          TRADEIN_CASH_DOWN = case_when(TRADEIN == 1 & CASH_DOWN == 1 ~1,TRUE ~0),
+#          CASH_DOWN_NO_TRADE = case_when(CASH_DOWN == 1 & TRADEIN == 0 ~ 1, TRUE ~ 0),
+#          TRADEIN_NO_CASH_DOWN = case_when(TRADEIN == 1 & CASH_DOWN == 0 ~ 1, TRUE ~0),
+#          LTVR_PTI_INTERACTION = LTVR * DEC_PAYMENT_TO_INCOME,
+#          BORR_PD_AVG_15_PLUS = case_when(BORR_PD_AVG >= .15 ~1, TRUE ~ 0),
+#          BORR_PD_AVG_16_PLUS = case_when(BORR_PD_AVG >= .16 ~1, TRUE ~ 0),
+#          BORR_PD_AVG_18_PLUS = case_when(BORR_PD_AVG >= .18 ~1, TRUE ~ 0),
+#          BORR_PD_AVG_20_PLUS = case_when(BORR_PD_AVG >= .2 ~1, TRUE ~ 0),
+#          BORR_PD_AVG_SQRT = sqrt(BORR_PD_AVG),
+#          BORR_PD_AVG_SQUARE = BORR_PD_AVG^2,
+#          BORR_SCORE_110_140 = case_when(BORR_SCORE_AVG >= 110 & BORR_SCORE_AVG < 140 ~ 1, TRUE ~ 0),
+#          TIER_GRADE = case_when(CREDIT_SCORE_AVG_OVERALL_CALC >= 620 ~ "PRIME_NEAR",
+#                                 CREDIT_SCORE_AVG_OVERALL_CALC < 620 ~ "SUB",
+#                                 is.na(CREDIT_SCORE_AVG_OVERALL_CALC) ~ "SUB"))
+# 
+# risk_apps_recent <- risk_apps_recent %>% 
+#   unite(TIER_LTVR, TIER_GRADE, LTVR_BIN2, sep = "_", remove = FALSE) %>% 
+#   unite(TIER_PTI, TIER_GRADE, PTI_BIN2, sep = "_", remove = FALSE) %>% 
+#   unite(TIER_MERCHANT_CATEGORY, TIER_GRADE, MERCHANT_CATEGORY, sep = "_", remove = FALSE)
+
+  
+
+```
+
+## Train/Test
+
+```{r TRAIN_Test}
+###Create time holdout
+risk_holdout <- risk_df %>%
+  filter(Application_Month >= "2019-05-31")
+risk_holdin <- risk_df %>%
+  filter(Application_Month < "2019-05-31")
+## set the seed to make your partition reproducible
+
+set.seed(24601)
+risk_split <- createDataPartition(risk_holdin$Performance_factor, p = .75,
+                              list = FALSE,
+                               times = 1)
+
+risk_train <- risk_holdin[risk_split, ]
+risk_test <- risk_holdin[-risk_split, ]
+
+risk_df%>%
+  summarise(Count = n(), Default_rate = formattable::percent(mean(New_DV)), 
+            Default_Rate_Unaltered = formattable::percent(mean(DEPENDENT_VARIABLE)), 
+            ASH4 = formattable::percent(mean(ASH4_PD))) %>%
+  gt() %>%
+  tab_header(title = "Full Data Set") %>%
+  gt_theme_espn()
+
+risk_holdin%>%
+  summarise(Count = n(), Default_Rate = formattable::percent(mean(New_DV)), 
+            Default_Rate_Unaltered = formattable::percent(mean(DEPENDENT_VARIABLE)), 
+            ASH4 = formattable::percent(mean(ASH4_PD))) %>%
+  gt() %>%
+  tab_header(title = "HoldIn Data Set") %>%
+  gt_theme_espn()
+
+risk_train%>%
+  summarise(Count = n(), Default_Rate = formattable::percent(mean(New_DV)), 
+            Default_Rate_Unaltered = formattable::percent(mean(DEPENDENT_VARIABLE)), 
+            ASH4 = formattable::percent(mean(ASH4_PD))) %>%
+  gt() %>%
+  tab_header(title = "Train Data Set") %>%
+  gt_theme_espn()
+
+risk_test%>%
+  summarise(Count = n(), Default_Rate = formattable::percent(mean(New_DV)), 
+            Default_Rate_Unaltered = formattable::percent(mean(DEPENDENT_VARIABLE)), 
+            ASH4 = formattable::percent(mean(ASH4_PD))) %>%
+  gt() %>%
+  tab_header(title = "Test Data Set") %>%
+  gt_theme_espn()
+
+risk_holdout%>%
+  summarise(Count = n(), Default_Rate = formattable::percent(mean(New_DV)), 
+            Default_Rate_Unaltered = formattable::percent(mean(DEPENDENT_VARIABLE)), 
+            ASH4 = formattable::percent(mean(ASH4_PD))) %>%
+  gt() %>%
+  tab_header(title = "Holdout Data Set (May-July 2019)") %>%
+  gt_theme_espn()
+
+
+```
+
+```{r NA_COUNTS, message=FALSE, warning=FALSE, include=FALSE}
+na.counts_risk <- risk_train %>% is.na %>% colSums() 
+na.counts_risk[na.counts_risk != 0]
+
+```
+
+## Risk WOE
+
+As part of the modeling process we will create Weight of Evidence (WOE) variables. This process helps us to capture relationships of an independent variable to the dependent variable that are non-linear. For example, the relationships between LTVR and the dependent variables is non-linear. The WOE process helps us partition those values into a separate category from the rest of the data. We have applied a WOE value for many of the variables. The WOE values are trained based off our training data set.
+
+```{r risk_woe, message=FALSE, warning=FALSE}
+risk_train_woe <- risk_train %>% 
+  select(LTVR, FLTVR, BORR_PD_AVG, DEC_PAYMENT_TO_INCOME, TOTAL_DOWN_CONTRACT_PERCENT,VEHICLE_AGE_AT_PURCHASE, VEHICLE_MILEAGE,
+         INCOME_DELTA, ORIGINAL_PRINCIPAL_BALANCE, CASH_DOWN_CONTRACT_PERCENT, BORR_PD_WAINCOME, 
+         PRIME_NEAR_GRADE_LTVR, PRIME_NEAR_GRADE_PTI, 
+         SUB_GRADE_LTVR, SUB_GRADE_PTI, TERM_OF_LOAN, DEC_DEBT_TO_INCOME,
+         PRIME_NEAR_GRADE_CASH_DOWN, SUB_GRADE_CASH_DOWN, PRIME_NEAR_GRADE_TOTAL_DOWN,
+         SUB_GRADE_TOTAL_DOWN, TIER_LTVR, TRADE_ALLOWANCE_PERCENT, REBATE_PERCENT, TIER_PTI, BORR_PD_LTVR_INTERACTION,
+         BORR_PD_PTI_INTERACTION, LTVR_PTI_INTERACTION, BORR_PD_FLTVR_INTERACTION, BORR_PD_LTVR_PTI_INTERACTION, BACK_END,
+         BORR_PD_BACK_END_INTERACTION, BORR_PD_FLTVR_PTI_INTERACTION,
+         Performance_factor)
+
+risk_woe_breaks <- list(LTVR = c(70,85,95,115,130),
+                    FLTVR = c(60,75,90,95,115),
+                    BORR_PD_AVG = c(.02,.04,.06,.08,.1,.12,.14,.16,.2,.25,.3),
+                    DEC_PAYMENT_TO_INCOME = c(2,4,6,8,10,12,14,16),
+                    TOTAL_DOWN_CONTRACT_PERCENT = c(5,10,15,20,30,40),
+                    INCOME_DELTA = c(1,1000,2000,3000,4000,6000,8000),
+                    ORIGINAL_PRINCIPAL_BALANCE = c(10000,20000,30000,40000,50000),
+                    CASH_DOWN_CONTRACT_PERCENT = c(5,10,15,20,30,40),
+                    BORR_PD_WAINCOME = c(.02,.04,.06,.08,.1,.12,.14,.16,.2,.25,.3),
+                    VEHICLE_AGE_AT_PURCHASE = c(0,1),
+                    VEHICLE_MILEAGE = c(500,5000),
+                    PRIME_NEAR_GRADE_LTVR = c(90,100,120,130),
+                    PRIME_NEAR_GRADE_PTI = c(2,4,6,10,12,14),
+                    PRIME_NEAR_GRADE_CASH_DOWN = c(5,10,20),
+                    PRIME_NEAR_GRADE_TOTAL_DOWN = c(5,10,20,30),
+                    SUB_GRADE_LTVR = c(70,85,100,115,130),
+                    SUB_GRADE_PTI = c(4,6,8,10,12,14,16),
+                    SUB_GRADE_CASH_DOWN = c(10,15,20,30,40),
+                    SUB_GRADE_TOTAL_DOWN = c(10,15,20,30,40),
+                    TERM_OF_LOAN = c(48,60,72),
+                    DEC_DEBT_TO_INCOME = c(20,30,40,50),
+                    TRADE_ALLOWANCE_PERCENT = c(-15,0,.01,15,25),
+                    REBATE_PERCENT = c(0,.01,5,10),
+                    BORR_PD_LTVR_INTERACTION = c(2,4,6,8,10,12,14,16,19,22,25,30,35),
+                    BORR_PD_PTI_INTERACTION = c(.2,.4,.6,.8,1,1.2,1.4,1.6,1.8,2,2.4,2.8),
+                    LTVR_PTI_INTERACTION = c(200,400,600,800,1000,1200,1400,1600,1800,2000,2200),
+                    BORR_PD_FLTVR_INTERACTION = c(2,4,6,8,10,12,14,16,18,20,25,30),
+                    BORR_PD_LTVR_PTI_INTERACTION = c(20,40,60,80,100,120,140,160,200,250,300,350,400),
+                    BORR_PD_BACK_END_INTERACTION = c(.5,1,1.5,2,2.5,3,4,5),
+                    BACK_END = c(1,5,10,15),
+                    BORR_PD_FLTVR_PTI_INTERACTION = c(10,20,30,50,75,100,125,150,175,200,225,250,275,300,350))
+
+risk_woe_special_values <- list(TIER_LTVR = c("PRIME_NEAR_[-Inf,100)","PRIME_NEAR_[100,130)",
+                                              "PRIME_NEAR_[130, Inf]","SUB_[-Inf,100)",
+                                              "SUB_[100,130)","SUB_[130, Inf]"),
+                                TIER_PTI = c("PRIME_NEAR_[-Inf,4)","PRIME_NEAR_[12, Inf]",
+                                             "PRIME_NEAR_[4,8)","PRIME_NEAR_[8,12)",
+                                             "SUB_[-Inf,4)","SUB_[12, Inf]","SUB_[4,8)","SUB_[8,12)"))
+
+
+risk_woe_bins <- woebin(risk_train_woe,y="Performance_factor", positive = "BAD"
+                   , breaks_list = risk_woe_breaks, special_values = risk_woe_special_values,
+                   no_cores = 4, count_distr_limit = .01)
+
+xyz <- risk_woe_bins$TIER_PTI
+
+woebin_plot(risk_woe_bins, show_barval = FALSE)
+
+
+```
+
+```{r risk_woe_transform, message=FALSE, warning=FALSE, include=FALSE}
+risk_train_woe <- woebin_ply(risk_train, bins = risk_woe_bins, to = "woe", no_cores = 2, print_step = 0)
+
+risk_train_woe <- sqldf("select trw.*, tr.LTVR, tr.FLTVR, tr.BORR_PD_AVG, tr.DEC_PAYMENT_TO_INCOME, tr.TOTAL_DOWN_CONTRACT_PERCENT, 
+tr.BORR_PD_WAINCOME, tr.VEHICLE_AGE_AT_PURCHASE, tr.TIER_LTVR, tr.TRADE_ALLOWANCE_PERCENT, tr.TIER_PTI, tr.BORR_PD_PTI_INTERACTION,
+tr.BORR_PD_LTVR_INTERACTION, tr.LTVR_PTI_INTERACTION, tr.BACK_END, tr.BORR_PD_FLTVR_INTERACTION, tr.BORR_PD_LTVR_PTI_INTERACTION,
+tr.BORR_PD_BACK_END_INTERACTION, tr.BORR_PD_FLTVR_PTI_INTERACTION
+  from risk_train_woe trw
+  left join risk_train tr on tr.XLOAN_NUM = trw.XLOAN_NUM")
+
+risk_test_woe <- woebin_ply(risk_test, bins = risk_woe_bins, to = "woe", no_cores = 2, print_step = 0)
+
+risk_test_woe <- sqldf("select trw.*, tr.LTVR, tr.FLTVR, tr.BORR_PD_AVG, tr.DEC_PAYMENT_TO_INCOME, tr.TOTAL_DOWN_CONTRACT_PERCENT,
+tr.BORR_PD_WAINCOME, tr.VEHICLE_AGE_AT_PURCHASE, tr.TIER_LTVR, tr.TRADE_ALLOWANCE_PERCENT, tr.TIER_PTI, tr.BORR_PD_PTI_INTERACTION,
+tr.BORR_PD_LTVR_INTERACTION, tr.LTVR_PTI_INTERACTION, tr.BACK_END, tr.BORR_PD_FLTVR_INTERACTION, tr.BORR_PD_LTVR_PTI_INTERACTION,
+tr.BORR_PD_BACK_END_INTERACTION, tr.BORR_PD_FLTVR_PTI_INTERACTION
+  from risk_test_woe trw
+  left join risk_test tr on tr.XLOAN_NUM = trw.XLOAN_NUM")
+
+risk_holdout_woe <- woebin_ply(risk_holdout, bins = risk_woe_bins, to = "woe", no_cores = 2, print_step = 0)
+
+risk_holdout_woe <- sqldf("select trw.*, tr.LTVR, tr.FLTVR, tr.BORR_PD_AVG, tr.DEC_PAYMENT_TO_INCOME, tr.TOTAL_DOWN_CONTRACT_PERCENT, 
+tr.BORR_PD_WAINCOME, tr.VEHICLE_AGE_AT_PURCHASE, tr.TIER_LTVR, tr.TRADE_ALLOWANCE_PERCENT, tr.TIER_PTI, tr.BORR_PD_PTI_INTERACTION,
+tr.BORR_PD_LTVR_INTERACTION, tr.LTVR_PTI_INTERACTION, tr.BACK_END, tr.BORR_PD_FLTVR_INTERACTION, tr.BORR_PD_LTVR_PTI_INTERACTION,
+tr.BORR_PD_BACK_END_INTERACTION, tr.BORR_PD_FLTVR_PTI_INTERACTION
+  from risk_holdout_woe trw
+  left join risk_holdout tr on tr.XLOAN_NUM = trw.XLOAN_NUM")
+
+
+# risk_apps_recent_woe <- woebin_ply(risk_apps_recent, bins = risk_woe_bins, to = "woe", no_cores = 2, print_step = 0)
+# 
+# risk_apps_recent_woe <- sqldf("select trw.*, tr.LTVR, tr.FLTVR, tr.BORR_PD_AVG, tr.DEC_PAYMENT_TO_INCOME, tr.TOTAL_DOWN_CONTRACT_PERCENT, 
+# tr.BORR_PD_WAINCOME, tr.VEHICLE_AGE_AT_PURCHASE, tr.TIER_LTVR, tr.TRADE_ALLOWANCE_PERCENT, tr.TIER_PTI, tr.BORR_PD_PTI_INTERACTION,
+# tr.BORR_PD_LTVR_INTERACTION, tr.LTVR_PTI_INTERACTION, tr.BACK_END, tr.BORR_PD_FLTVR_INTERACTION, tr.BORR_PD_LTVR_PTI_INTERACTION,
+# tr.BORR_PD_BACK_END_INTERACTION, tr.BORR_PD_FLTVR_PTI_INTERACTION
+#   from risk_apps_recent_woe trw
+#   left join risk_apps_recent tr on tr.APP_NUM = trw.APP_NUM")
+
+
+
+
+```
+
+## Variable Selection
+
+A few variables need to be filtered out of our data set so we can train our model. Some of these variables are LOAN_NUM, BOOK_MONTH, APR, and etc. These cannot be used for modeling but will be helpful in our review process. Also, we filter out any variables that have been flagged during the variable review process.
+
+```{r RISK_MODEL_VARIABLES}
+risk_train_variables <- risk_train_woe %>%
+  select (-c(XLOAN_NUM, XBOOK_DATE, XBOOK_MONTH, XBOOK_YEAR, XORIGINATION_QTR, XORIGINATION_MTH, XMERCHANT_NAME, XMerchant_GROUP,
+             XCREDIT_OFFICER_NAME,xVERIFICATION_OFFICER_NAME,CATEGORY_LEVEL_NAME,CREDIT_SCORE_AVG_CALC,DEC_CREDIT_SCORE, Application_Month,
+             ASH4_PD,EXPECTED_LOSS_AMOUNT, PB_VOE_STATUS,PRI_BORR_PD,SEC_BORR_PD,New_DV, XAFM_SCORE,XDEALER_SCORE,XINCOMEPASS_SCORE, DEPENDENT_VARIABLE,
+             XREPORT_DATE, XCONTRACT_INTEREST_RATE, XVEHICLE_MODEL_CLEAN,XVEHICLE_MAKE_MODEL_CLEAN, XVEHICLE_YEAR, BOOK_VALUE_SOURCE,
+             App_Interview_status, APP_HOUR, INDEPENDENT, XPAYMENT_AMOUNT, ORIGINAL_LESS_BOOK, ORIGINAL_PRINCIPLE_BALANCE_MIN_10k_MAX_45k,
+             BALANCE_TO_TERM, CASH_DOWN_CONTRACT_PERCENT_MAX30, PRI_INCOME, SEC_INCOME, TOTAL_INCOME, TOTAl_EMPLOYMENT_MONTHS, AVERAGE_INCOME, 
+             AVERAGE_EMPLOYMENT_MONTHS, PRI_ASH5_SCORE, SEC_ASH5_SCORE, ASH5_Borrower_Grade, NEW_OR_USED))
+
+
+risk_test_variables <- risk_test_woe %>% 
+  select (-c(XLOAN_NUM, XBOOK_DATE, XBOOK_MONTH, XBOOK_YEAR, XORIGINATION_QTR, XORIGINATION_MTH, XMERCHANT_NAME, XMerchant_GROUP,
+             XCREDIT_OFFICER_NAME,xVERIFICATION_OFFICER_NAME,CATEGORY_LEVEL_NAME,CREDIT_SCORE_AVG_CALC,DEC_CREDIT_SCORE, Application_Month,
+             ASH4_PD,EXPECTED_LOSS_AMOUNT, PB_VOE_STATUS,PRI_BORR_PD,SEC_BORR_PD,New_DV, XAFM_SCORE,XDEALER_SCORE,XINCOMEPASS_SCORE, DEPENDENT_VARIABLE,
+             XREPORT_DATE, XCONTRACT_INTEREST_RATE, XVEHICLE_MODEL_CLEAN,XVEHICLE_MAKE_MODEL_CLEAN, XVEHICLE_YEAR, BOOK_VALUE_SOURCE,
+             App_Interview_status, APP_HOUR, INDEPENDENT, XPAYMENT_AMOUNT, ORIGINAL_LESS_BOOK, ORIGINAL_PRINCIPLE_BALANCE_MIN_10k_MAX_45k,
+             BALANCE_TO_TERM, CASH_DOWN_CONTRACT_PERCENT_MAX30, PRI_INCOME, SEC_INCOME, TOTAL_INCOME, TOTAl_EMPLOYMENT_MONTHS, AVERAGE_INCOME, 
+             AVERAGE_EMPLOYMENT_MONTHS, PRI_ASH5_SCORE, SEC_ASH5_SCORE, ASH5_Borrower_Grade, NEW_OR_USED))
+
+risk_holdout_variables <- risk_holdout_woe %>% 
+  select (-c(XLOAN_NUM, XBOOK_DATE, XBOOK_MONTH, XBOOK_YEAR, XORIGINATION_QTR, XORIGINATION_MTH, XMERCHANT_NAME, XMerchant_GROUP,
+             XCREDIT_OFFICER_NAME,xVERIFICATION_OFFICER_NAME,CATEGORY_LEVEL_NAME,CREDIT_SCORE_AVG_CALC,DEC_CREDIT_SCORE, Application_Month,
+             ASH4_PD,EXPECTED_LOSS_AMOUNT, PB_VOE_STATUS,PRI_BORR_PD,SEC_BORR_PD,New_DV, XAFM_SCORE,XDEALER_SCORE,XINCOMEPASS_SCORE, DEPENDENT_VARIABLE,
+             XREPORT_DATE, XCONTRACT_INTEREST_RATE, XVEHICLE_MODEL_CLEAN,XVEHICLE_MAKE_MODEL_CLEAN, XVEHICLE_YEAR, BOOK_VALUE_SOURCE,
+             App_Interview_status, APP_HOUR, INDEPENDENT, XPAYMENT_AMOUNT, ORIGINAL_LESS_BOOK, ORIGINAL_PRINCIPLE_BALANCE_MIN_10k_MAX_45k,
+             BALANCE_TO_TERM, CASH_DOWN_CONTRACT_PERCENT_MAX30, PRI_INCOME, SEC_INCOME, TOTAL_INCOME, TOTAl_EMPLOYMENT_MONTHS, AVERAGE_INCOME, 
+             AVERAGE_EMPLOYMENT_MONTHS, PRI_ASH5_SCORE, SEC_ASH5_SCORE, ASH5_Borrower_Grade, NEW_OR_USED))
+
+# risk_apps_recent_variables <- risk_apps_recent_woe %>%
+#   select(c(Borrower_Count, JOINT_SAME_ADDR, X0_INCOME_BORROWER, X0_MONTHS_EMPLOYMENT_BORROWER, MERCHANT_STATE, 
+#            REGION, Affiliated, TIER_MERCHANT_CATEGORY, MERCHANT_CATEGORY,
+#            UNDERWRITING_TYPE_NAME, IS_OPEN_LENDING,XINCOME_VERIFICATION_LEVEL_NUM, WAS_REFINANCED, X72plus_TERM,
+#            X73plus_TERM,ORIGINAL_PRINCIPAL_BALANCE_GREATER_45k, BOOK_VALUE, ANY_TOTAL_DOWN, POSITIVE_TOTAL_DOWN, NEGATIVE_TOTAL_DOWN,
+#            TOTAL_DOWN_CONTRACT_PERCENT_MIN_NEG30_MAX40, CASH_DOWN,TRADEIN, NEGATIVE_TRADEIN, POSITIVE_TRADEIN,
+#            REBATE, DEALER_ADDS_PERCENT, DEALER_ADDS_PERCENT_M_20, DEALER_ADDS_PERCENT_BINARY, DAYS_TO_FIRST_PAYMENT,
+#            DEC_LOAN_TO_VALUE,MONTHLY_PRINCIPAL_TO_INCOME, DTI_MIN_20, DTI_MIN_20_MAX_55, VEHICLE_MAKE_CLEAN,
+#            VEHICLE_TYPE, NEW_Less_1_YEAR, NEW_0_YEAR, NEW_1_plus_YEAR, NEW_LOW_MILEAGE, NEW_MILEAGE_101_plus,
+#            USED_MILEAGE_BELOW20K, MILEAGE_ABOVE50K, MILEAGE_ABOVE75K, MILEAGE_ABOVE100K, MILEAGE_ABOVE150K, HIGH_END, HONDA_TOYOTA,
+#            COUNTRY, CLASS, PARENT, PRI_BOR_SSN_XC, PRI_BOR_HOME_PHONE_XC, PRI_BOR_CELL_PHONE_XC, SEC_BOR_SSN_XC,
+#            SEC_BOR_HOME_PHONE_XC, SEC_BOR_CELL_PHONE_XC, APP_DAY_OF_WEEK, BORR_SCORE, FLTVR_BIN, LTVR_BIN, LTVR_BIN2, PTI_BIN, PTI_BIN2,
+#            BORR_PD_AVG_BIN,
+#            TOTAL_DOWN_CONTRACT_PERCENT_BIN, Mileage_bin, LTVR_below_95, Vehicle_age_bin, DODGE_MITSUBISHI, SUB_LTVR_130_PLUS,
+#            SUB_CASH_DOWN_10_PCT_LESS, SUB_NO_TRADE, CASH_DOWN_5_PCT_LESS, CASH_DOWN_20_PCT_PLUS, TOTAL_DOWN_5_PCT_LESS,
+#            TOTAL_DOWN_20_PCT_PLUS, MILEAGE_5000_LESS, PTI_15_PLUS, TRADEIN_CASH_DOWN, CASH_DOWN_NO_TRADE, TRADEIN_NO_CASH_DOWN,
+#            BORR_PD_AVG_15_PLUS,  BORR_PD_AVG_16_PLUS, BORR_PD_AVG_18_PLUS, BORR_PD_AVG_20_PLUS, BORR_PD_AVG_SQRT, BORR_PD_AVG_SQUARE,
+#            BORR_SCORE_110_140,
+#            TIER_GRADE,
+#            LTVR_woe, FLTVR_woe,BORR_PD_AVG_woe,
+#            DEC_PAYMENT_TO_INCOME_woe, TOTAL_DOWN_CONTRACT_PERCENT_woe, VEHICLE_AGE_AT_PURCHASE_woe, VEHICLE_MILEAGE_woe, INCOME_DELTA_woe,
+#            ORIGINAL_PRINCIPAL_BALANCE_woe, CASH_DOWN_CONTRACT_PERCENT_woe, BORR_PD_WAINCOME_woe, PRIME_NEAR_GRADE_LTVR_woe, PRIME_NEAR_GRADE_PTI_woe,
+#            SUB_GRADE_LTVR_woe, SUB_GRADE_PTI_woe, TERM_OF_LOAN_woe, DEC_DEBT_TO_INCOME_woe, PRIME_NEAR_GRADE_CASH_DOWN_woe, 
+#            SUB_GRADE_CASH_DOWN_woe, PRIME_NEAR_GRADE_TOTAL_DOWN_woe, SUB_GRADE_TOTAL_DOWN_woe, TIER_LTVR_woe, TRADE_ALLOWANCE_PERCENT_woe,
+#            REBATE_PERCENT_woe, TIER_PTI_woe, BORR_PD_LTVR_INTERACTION_woe, BORR_PD_PTI_INTERACTION_woe, LTVR_PTI_INTERACTION_woe,
+#            BORR_PD_FLTVR_INTERACTION_woe, BORR_PD_LTVR_PTI_INTERACTION_woe, BACK_END_woe, BORR_PD_BACK_END_INTERACTION_woe, 
+#            BORR_PD_FLTVR_PTI_INTERACTION_woe, LTVR,
+#            FLTVR, BORR_PD_AVG, DEC_PAYMENT_TO_INCOME, TOTAL_DOWN_CONTRACT_PERCENT, BORR_PD_WAINCOME, VEHICLE_AGE_AT_PURCHASE,
+#            TIER_LTVR, TRADE_ALLOWANCE_PERCENT, TIER_PTI, BORR_PD_PTI_INTERACTION, BORR_PD_LTVR_INTERACTION,
+#            LTVR_PTI_INTERACTION, BACK_END, BORR_PD_FLTVR_INTERACTION, BORR_PD_LTVR_PTI_INTERACTION, BORR_PD_BACK_END_INTERACTION,
+#            BORR_PD_FLTVR_PTI_INTERACTION))
+
+
+
+```
+
+## Risk Model
+
+Our risk model is using a Generalized Logistic Regression with Lasso feature selection. The Lasso feature selections will automatically select those features that are useful, discarding the useless or redundant features. We artfully do our best to find a good balance between predictive power (measured by AUC on the train set), over-fit (measured by out of sample AUC), and model complexity (number of variables). The rule of Occam's razor is followed as the simplest model producing similar results is best.
+
+The first chart gives us a sense of cross validated models and their respective AUC with different lambda (Penalty factors) and their corresponding number of variables. For our model we chose the farthest most left dotted line giving us the highest predictive power.
+
+```{r Risk_Model, message=FALSE, warning=FALSE}
+#One Hot Encoding
+risk_train_xfac <- risk_train_variables %>%
+  select(PTI_BIN, LTVR_BIN, TOTAL_DOWN_CONTRACT_PERCENT_BIN, FLTVR_BIN, BORR_PD_AVG_BIN, JOINT_SAME_ADDR, MERCHANT_CATEGORY,
+         VEHICLE_TYPE, REGION, UNDERWRITING_TYPE_NAME,IS_OPEN_LENDING, VEHICLE_MAKE_CLEAN, COUNTRY, CLASS, PARENT,  APP_DAY_OF_WEEK, 
+         Mileage_bin, LTVR_below_95, Vehicle_age_bin, MERCHANT_STATE, TIER_LTVR, TIER_PTI, TIER_GRADE, LTVR_BIN2, PTI_BIN2,
+         TIER_MERCHANT_CATEGORY)
+
+risk_test_xfac <- risk_test_variables %>% 
+  select(PTI_BIN, LTVR_BIN, TOTAL_DOWN_CONTRACT_PERCENT_BIN, FLTVR_BIN, BORR_PD_AVG_BIN, JOINT_SAME_ADDR, MERCHANT_CATEGORY,
+         VEHICLE_TYPE, REGION, UNDERWRITING_TYPE_NAME,IS_OPEN_LENDING, VEHICLE_MAKE_CLEAN, COUNTRY, CLASS, PARENT,  APP_DAY_OF_WEEK, 
+         Mileage_bin, LTVR_below_95, Vehicle_age_bin, MERCHANT_STATE, TIER_LTVR, TIER_PTI, TIER_GRADE, LTVR_BIN2, PTI_BIN2,
+         TIER_MERCHANT_CATEGORY)
+
+risk_holdout_xfac <- risk_holdout_variables %>% 
+  select(PTI_BIN, LTVR_BIN, TOTAL_DOWN_CONTRACT_PERCENT_BIN, FLTVR_BIN, BORR_PD_AVG_BIN, JOINT_SAME_ADDR, MERCHANT_CATEGORY,
+         VEHICLE_TYPE, REGION, UNDERWRITING_TYPE_NAME,IS_OPEN_LENDING, VEHICLE_MAKE_CLEAN, COUNTRY, CLASS, PARENT,  APP_DAY_OF_WEEK, 
+         Mileage_bin, LTVR_below_95, Vehicle_age_bin, MERCHANT_STATE, TIER_LTVR, TIER_PTI, TIER_GRADE, LTVR_BIN2, PTI_BIN2,
+         TIER_MERCHANT_CATEGORY)
+
+# risk_apps_recent_xfac <- risk_apps_recent_variables %>%
+#   select(PTI_BIN, LTVR_BIN, TOTAL_DOWN_CONTRACT_PERCENT_BIN, FLTVR_BIN, BORR_PD_AVG_BIN, JOINT_SAME_ADDR, MERCHANT_CATEGORY,
+#          VEHICLE_TYPE, REGION, UNDERWRITING_TYPE_NAME,IS_OPEN_LENDING, VEHICLE_MAKE_CLEAN, COUNTRY, CLASS, PARENT,  APP_DAY_OF_WEEK, 
+#          Mileage_bin, LTVR_below_95, Vehicle_age_bin, MERCHANT_STATE, TIER_LTVR, TIER_PTI, TIER_GRADE, LTVR_BIN2, PTI_BIN2,
+#          TIER_MERCHANT_CATEGORY)
+
+
+risk_xfac <- makeX(risk_train_xfac,risk_test_xfac)
+risk_xfac2 <- makeX(risk_train_xfac,risk_holdout_xfac)
+# risk_xfac3 <- makeX(risk_train_xfac,risk_apps_recent_xfac)
+
+
+##Create X Data Sets
+risk_train_x <- risk_train_variables %>% 
+  select(-c(Performance_factor,PTI_BIN, LTVR_BIN, TOTAL_DOWN_CONTRACT_PERCENT_BIN, FLTVR_BIN, BORR_PD_AVG_BIN, JOINT_SAME_ADDR, 
+            MERCHANT_CATEGORY, VEHICLE_TYPE, REGION, UNDERWRITING_TYPE_NAME,IS_OPEN_LENDING, VEHICLE_MAKE_CLEAN, COUNTRY, CLASS, PARENT, 
+            APP_DAY_OF_WEEK, Mileage_bin, LTVR_below_95,Vehicle_age_bin, MERCHANT_STATE, TIER_LTVR, TIER_PTI, TIER_GRADE,
+            LTVR_BIN2, PTI_BIN2,TIER_MERCHANT_CATEGORY)) %>% 
+as.matrix()
+
+risk_test_x <- risk_test_variables %>% 
+  select(-c(Performance_factor, PTI_BIN, LTVR_BIN, TOTAL_DOWN_CONTRACT_PERCENT_BIN, FLTVR_BIN, BORR_PD_AVG_BIN, JOINT_SAME_ADDR,
+            MERCHANT_CATEGORY, VEHICLE_TYPE, REGION, UNDERWRITING_TYPE_NAME,IS_OPEN_LENDING, VEHICLE_MAKE_CLEAN, COUNTRY, CLASS, PARENT, 
+            APP_DAY_OF_WEEK, Mileage_bin, LTVR_below_95, Vehicle_age_bin, MERCHANT_STATE, TIER_LTVR, TIER_PTI, TIER_GRADE,
+            LTVR_BIN2, PTI_BIN2,TIER_MERCHANT_CATEGORY)) %>% 
+as.matrix()
+
+risk_holdout_x <- risk_holdout_variables %>% 
+  select(-c(Performance_factor,PTI_BIN, LTVR_BIN, TOTAL_DOWN_CONTRACT_PERCENT_BIN, FLTVR_BIN, BORR_PD_AVG_BIN, JOINT_SAME_ADDR,
+            MERCHANT_CATEGORY, VEHICLE_TYPE, REGION, UNDERWRITING_TYPE_NAME,IS_OPEN_LENDING, VEHICLE_MAKE_CLEAN, COUNTRY, CLASS, PARENT, 
+            APP_DAY_OF_WEEK, Mileage_bin, LTVR_below_95, Vehicle_age_bin, MERCHANT_STATE, TIER_LTVR, TIER_PTI, TIER_GRADE,
+            LTVR_BIN2, PTI_BIN2,TIER_MERCHANT_CATEGORY)) %>% 
+as.matrix()
+
+# risk_apps_recent_x <- risk_apps_recent_variables %>%
+#   select(-c(PTI_BIN, LTVR_BIN, TOTAL_DOWN_CONTRACT_PERCENT_BIN, FLTVR_BIN, BORR_PD_AVG_BIN, JOINT_SAME_ADDR,
+#             MERCHANT_CATEGORY, VEHICLE_TYPE, REGION, UNDERWRITING_TYPE_NAME,IS_OPEN_LENDING, VEHICLE_MAKE_CLEAN, COUNTRY, CLASS, PARENT, 
+#             APP_DAY_OF_WEEK, Mileage_bin, LTVR_below_95, Vehicle_age_bin, MERCHANT_STATE, TIER_LTVR, TIER_PTI, TIER_GRADE,
+#             LTVR_BIN2, PTI_BIN2,TIER_MERCHANT_CATEGORY)) %>% 
+# as.matrix()
+
+##Bind
+risk_train_x <- cbind(risk_train_x,risk_xfac$x)
+risk_test_x <- cbind(risk_test_x,risk_xfac$xtest)
+risk_holdout_x <- cbind(risk_holdout_x,risk_xfac2$xtest)
+# risk_apps_recent_x <- cbind(risk_apps_recent_x,risk_xfac3$xtest)
+
+
+###Create Y Data Set
+risk_train_y <- risk_train_variables %>% 
+  select (Performance_factor) %>% 
+  as.matrix()
+
+
+## Assigning Penalty Factor
+risk_p.fac <- rep(1,ncol(risk_train_x))
+risk_p.fac[which(colnames(risk_train_x)=="VEHICLE_MAKE_CLEANMASERATI")] <- 2
+risk_p.fac[which(colnames(risk_train_x)=="VEHICLE_MAKE_CLEANSAAB")] <- 2
+risk_p.fac[which(colnames(risk_train_x)=="VEHICLE_MAKE_CLEANSUZUKI")] <- 2
+risk_p.fac[which(colnames(risk_train_x)=="VEHICLE_MAKE_CLEANFIAT")] <- 2
+#risk_p.fac[which(colnames(risk_train_x)=="BORR_PD_AVG_woe")] <- 2
+risk_p.fac[which(colnames(risk_train_x)=="BORR_PD_WAINCOME_woe")] <- 2
+risk_p.fac[which(colnames(risk_train_x)=="BORR_PD_AVG")] <- 2
+#risk_p.fac[which(colnames(risk_train_x)=="BORR_PD_AVG_16_PLUS")] <- 2
+#risk_p.fac[which(colnames(risk_train_x)=="BORR_SCORE")] <- 2
+risk_p.fac[which(colnames(risk_train_x)=="DEC_LOAN_TO_VALUE")] <- 2
+risk_p.fac[which(colnames(risk_train_x)=="PARENTSAAB")] <- 2
+risk_p.fac[which(colnames(risk_train_x)=="PARENTNULL")] <- 2
+risk_p.fac[which(colnames(risk_train_x)=="NEW_0_YEAR")] <- 2
+risk_p.fac[which(colnames(risk_train_x)=="NEW_LOW_MILEAGE")] <- 2
+risk_p.fac[which(colnames(risk_train_x)=="USED_MILEAGE_BELOW20K")] <- 2
+risk_p.fac[which(colnames(risk_train_x)=="BORR_PD_AVG_BIN[0.18,0.2)")] <- 2
+risk_p.fac[which(colnames(risk_train_x)=="BORR_PD_AVG_BIN[0.16,0.18)")] <- 2
+#risk_p.fac[which(colnames(risk_train_x)=="BORR_PD_AVG_15_PLUS")] <- 2
+risk_p.fac[which(colnames(risk_train_x)=="BORR_SCORE_110_140")] <- 2
+risk_p.fac[which(colnames(risk_train_x)=="LTVR_BIN[130,145)")] <- 2
+risk_p.fac[which(colnames(risk_train_x)=="TIER_LTVRSUB_[130, Inf]")] <- 2
+risk_p.fac[which(colnames(risk_train_x)=="BORR_PD_AVG_SQRT")] <- 2
+risk_p.fac[which(colnames(risk_train_x)=="SUB_GRADE_TOTAL_DOWN_woe")] <- 3
+#risk_p.fac[which(colnames(risk_train_x)=="BORR_PD_PTI_INTERACTION")] <- 2
+#risk_p.fac[which(colnames(risk_train_x)=="BORR_PD_LTVR_INTERACTION")] <- 2
+risk_p.fac[which(colnames(risk_train_x)=="SUB_CASH_DOWN_10_PCT_LESS")] <- 2
+risk_p.fac[which(colnames(risk_train_x)=="SUB_NO_TRADE")] <- 2
+risk_p.fac[which(colnames(risk_train_x)=="SUB_LTVR_130_PLUS")] <- 2
+risk_p.fac[which(colnames(risk_train_x)=="PRIME_NEAR_GRADE_TOTAL_DOWN_woe")] <- 2
+risk_p.fac[which(colnames(risk_train_x)=="TIER_LTVR_woe")] <- 2
+#risk_p.fac[which(colnames(risk_train_x)=="TOTAL_DOWN_CONTRACT_PERCENT_BIN[-Inf,5)")] <- 2
+#risk_p.fac[which(colnames(risk_train_x)=="LTVR_PTI_INTERACTION")] <- 2
+risk_p.fac[which(colnames(risk_train_x)=="PRIME_NEAR_GRADE_LTVR_woe")] <- 2
+risk_p.fac[which(colnames(risk_train_x)=="BORR_PD_AVG_BIN[0.07,0.08)")] <- 2
+risk_p.fac[which(colnames(risk_train_x)=="BORR_PD_AVG_BIN[0.24,0.28)")] <- 2
+risk_p.fac[which(colnames(risk_train_x)=="NEGATIVE_TRADEIN")] <- 2
+risk_p.fac[which(colnames(risk_train_x)=="TIER_LTVRPRIME_NEAR_[100,130)")] <- 2
+risk_p.fac[which(colnames(risk_train_x)=="PRIME_NEAR_GRADE_PTI_woe")] <- 2
+risk_p.fac[which(colnames(risk_train_x)=="SUB_GRADE_LTVR_woe")] <- 2
+risk_p.fac[which(colnames(risk_train_x)=="PRIME_NEAR_GRADE_CASH_DOWN_woe")] <- 2
+risk_p.fac[which(colnames(risk_train_x)=="TIER_GRADEPRIME_NEAR")] <- 2
+risk_p.fac[which(colnames(risk_train_x)=="TIER_GRADESUB")] <- 2
+risk_p.fac[which(colnames(risk_train_x)=="TIER_MERCHANT_CATEGORYPRIME_NEAR_Franchise")] <- 2
+risk_p.fac[which(colnames(risk_train_x)=="SUB_GRADE_PTI_woe")] <- 2
+risk_p.fac[which(colnames(risk_train_x)=="TIER_PTI_woe")] <- 2
+risk_p.fac[which(colnames(risk_train_x)=="TIER_MERCHANT_CATEGORYSUB_Franchise")] <- 2
+risk_p.fac[which(colnames(risk_train_x)=="TIER_PTIPRIME_NEAR_[8,12)")] <- 2
+risk_p.fac[which(colnames(risk_train_x)=="PRIME_NEAR_GRADE_LTVR_woe")] <- 3
+risk_p.fac[which(colnames(risk_train_x)=="SUB_GRADE_CASH_DOWN_woe")] <- 3
+risk_p.fac[which(colnames(risk_train_x)=="TIER_LTVRSUB_[100,130)")] <- 3
+risk_p.fac[which(colnames(risk_train_x)=="BORR_PD_LTVR_INTERACTION_woe")] <- 2
+risk_p.fac[which(colnames(risk_train_x)=="BORR_PD_LTVR_PTI_INTERACTION_woe")] <- 2
+risk_p.fac[which(colnames(risk_train_x)=="BORR_PD_PTI_INTERACTION_woe")] <- 2
+risk_p.fac[which(colnames(risk_train_x)=="IS_OPEN_LENDINGTRUE")] <- 2
+risk_p.fac[which(colnames(risk_train_x)=="TOTAL_DOWN_CONTRACT_PERCENT_BIN[-Inf,5)")] <- 2
+
+
+
+risk_p.fac[which(colnames(risk_train_x)=="HIGH_END")] <- .1
+risk_p.fac[which(colnames(risk_train_x)=="MERCHANT_CATEGORYIndependent")] <- .3
+risk_p.fac[which(colnames(risk_train_x)=="MERCHANT_CATEGORYDirect")] <- .05
+#risk_p.fac[which(colnames(risk_train_x)=="LTVR_woe")] <- .5
+# risk_p.fac[which(colnames(risk_train_x)=="FLTVR_woe")] <- .5
+#risk_p.fac[which(colnames(risk_train_x)=="ANY_TOTAL_DOWN")] <- .5
+#risk_p.fac[which(colnames(risk_train_x)=="TRADEIN")] <- .8
+# #risk_p.fac[which(colnames(risk_train_x)=="POSITIVE_TRADEIN")] <- .5
+risk_p.fac[which(colnames(risk_train_x)=="VEHICLE_AGE_AT_PURCHASE_woe")] <- .5
+risk_p.fac[which(colnames(risk_train_x)=="MILEAGE_5000_LESS")] <- .5
+#risk_p.fac[which(colnames(risk_train_x)=="DEC_PAYMENT_TO_INCOME_woe")] <- .5
+#risk_p.fac[which(colnames(risk_train_x)=="CASH_DOWN_CONTRACT_PERCENT_woe")] <- .5
+# risk_p.fac[which(colnames(risk_train_x)=="DEC_PAYMENT_TO_INCOME")] <- .5
+#risk_p.fac[which(colnames(risk_train_x)=="SUB_LTVR_130_PLUS")] <- .5
+#risk_p.fac[which(colnames(risk_train_x)=="TIER_LTVR")] <- .5
+# #risk_p.fac[which(colnames(risk_train_x)=="CASH_DOWN_5_PCT_LESS")] <- .3
+# #risk_p.fac[which(colnames(risk_train_x)=="CASH_DOWN_20_PCT_PLUS")] <- .3
+#risk_p.fac[which(colnames(risk_train_x)=="REBATE_PERCENT_woe")] <- .5
+# risk_p.fac[which(colnames(risk_train_x)=="SUB_CASH_DOWN_10_PCT_LESS")] <- 1
+#risk_p.fac[which(colnames(risk_train_x)=="TOTAL_DOWN_5_PCT_LESS")] <- .2
+#risk_p.fac[which(colnames(risk_train_x)=="TOTAL_DOWN_20_PCT_PLUS")] <- .5
+#risk_p.fac[which(colnames(risk_train_x)=="BORR_PD_AVG_woe")] <- .5
+# risk_p.fac[which(colnames(risk_train_x)=="BORR_PD_AVG")] <- .9
+#risk_p.fac[which(colnames(risk_train_x)=="BORR_PD_WAINCOME")] <- .5
+# #risk_p.fac[which(colnames(risk_train_x)=="BORR_PD_AVG_SQRT")] <- .9
+# #risk_p.fac[which(colnames(risk_train_x)=="BORR_PD_WAINCOME_woe")] <- .8
+#risk_p.fac[which(colnames(risk_train_x)=="PTI_15_PLUS")] <- .5
+#risk_p.fac[which(colnames(risk_train_x)=="TIER_PTI_woe")] <- .5
+#risk_p.fac[which(colnames(risk_train_x)=="REGIONSoutheast")] <- .5
+#risk_p.fac[which(colnames(risk_train_x)=="PRIME_NEAR_GRADE_LTVR_woe")] <- .5
+#risk_p.fac[which(colnames(risk_train_x)=="BORR_PD_AVG_15_PLUS")] <- .5
+#risk_p.fac[which(colnames(risk_train_x)=="BORR_PD_AVG_18_PLUS")] <- .5
+#risk_p.fac[which(colnames(risk_train_x)=="TIER_MERCHANT_CATEGORYSUB_Independent")] <- .8
+#risk_p.fac[which(colnames(risk_train_x)=="BORR_PD_LTVR_INTERACTION_woe")] <- .8
+
+
+
+
+
+##Glmnet Model
+set.seed(24601)
+risk_glmnet_model <- cv.glmnet(risk_train_x,risk_train_y,family ="binomial", 
+                    alpha = 1, 
+                    type.measure = "auc",
+                    penalty.factor = risk_p.fac,         
+                    dfmax = 100)
+
+plot(risk_glmnet_model, label = TRUE)
+
+risk_glmnet_model
+
+coef(risk_glmnet_model, s = "lambda.min")
+
+
+
+```
+
+## Risk Model Coefficients
+
+```{r Risk_Coef, message=FALSE, warning=FALSE}
+
+##Coefficients
+
+risk_model_coef <- coef(risk_glmnet_model, s = "lambda.min") %>% 
+  as.matrix()  %>% 
+  as.data.frame() %>% 
+  filter(s1 != 0)
+
+
+colnames(risk_model_coef)[colnames(risk_model_coef) == 'min'] <-  'Coefficients'
+
+risk_model_coef <- setNames(cbind(rownames(risk_model_coef), risk_model_coef, row.names = NULL), c("Attribute","Coefficients"))
+
+risk_model_coef %>%
+  gt() %>%
+  gt_theme_espn()
+
+```
+
+## Risk Model Train
+
+```{r RM_EVALUATE}
+#Predict
+risk_train_predictions <- predict(risk_glmnet_model, newx = risk_train_x, type = "response", s = "lambda.min")
+risk_train_predictions <- cbind(risk_train_predictions,risk_train)
+risk_train_predictions <- risk_train_predictions %>% 
+  mutate(BAD = 1- lambda.min)
+
+risk_train_predictions %>%
+  summarise(Cnt = n(), 
+            Model = round(auc(New_DV,BAD),4), 
+            ASH4 = round(auc(New_DV,ASH4_PD),4),
+            Default_Rate = formattable::percent(mean(New_DV)), 
+            Default_Rate_Unaltered = formattable::percent(mean(DEPENDENT_VARIABLE)), 
+            ASH5 = formattable::percent(mean(BAD)), ASH4_Rate = formattable::percent(mean(ASH4_PD))) %>%
+  gt() %>%
+  gt_theme_espn() %>%
+  tab_header(title = "Train AUC and ASH4")
+
+#Preds Vs Actual
+ggplotly(ggplot(data = risk_train_predictions %>%
+  group_by(Pred_bin = #cut_width(BAD,.01, boundary = 0)) %>% 
+    cut(BORR_PD_LTVR_INTERACTION, c(2,4,6,8,10,12,14,16,18,20,22,24,27,30,35))) %>%
+    #Pred_bin = BORROWER_COUNT) %>%
+  summarise(cnt = n(), ASH5 = formattable::percent(mean(BAD)), 
+            Actual = formattable::percent(mean(New_DV)), 
+            ASH4 = formattable::percent(mean(ASH4_PD))) %>%
+    filter(cnt > 50),
+  aes(x = ASH5, y = ASH4, key = Pred_bin, label = Actual))+
+  geom_point(aes(size = cnt))+
+  geom_text(aes(label =  Pred_bin),hjust = -.5,vjust = .5,check_overlap = TRUE, size = 3)+
+  scale_x_continuous(labels = scales::percent_format(accuracy = 1L), limits = c(0,.3)) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1L), limits = c(0,.3)) +
+  geom_abline(aes(intercept = 0, slope = 1)) +
+  theme_minimal()+
+  ggtitle("ASH5 vs ASH4"))
+  
+
+#Preds Vs Actual
+ggplotly(
+  ggplot(data = risk_train_predictions %>%
+           #filter(BORR_SCORE < 140) %>% 
+  group_by(Pred_bin = #cut(BORR_SCORE,c(-Inf,140,Inf)),
+             #cut(DEC_PAYMENT_TO_INCOME, c(-Inf,0,2,4,6,8,10,12,14,16,Inf))) %>% 
+   #cut(BAD, c(-Inf, 0,.02,.4,.06,.08,.1,.12,.14,.16,.18,.2,Inf))) %>% 
+    #cut(TOTAL_DOWN_CONTRACT_PERCENT, c(-Inf,-20,-10,0,.01,5,10,20,30,40,50,Inf))) %>%
+    #cut(REBATE_PERCENT, c(-Inf,-20,-10,0,.01,5,10,20,30,40,50,Inf))) %>%
+     #cut(CASH_DOWN_CONTRACT_PERCENT, c(-Inf,0,.01,5,10,20,30,40,50,Inf))) %>%
+     #cut(TRADE_ALLOWANCE_PERCENT, c(-Inf,-20,-10,0,.01,5,10,20,30,40,50,Inf))) %>%
+    cut(BORR_PD_AVG, c(-Inf, 0,.02,.4,.06,.08,.1,.12,.14,.16,.18,.2,.25,.3,Inf))) %>%  
+     #cut(BORR_SCORE, c(-Inf,110,130,140,150,160,170,180,190,200,210))) %>% 
+    #cut(LTVR, c(-Inf, 70,80,90,100,110,120,130,140,145,Inf))) %>%  
+     #cut(VEHICLE_MILEAGE,c(-Inf,100,500,5000,20000,50000,100000))) %>% 
+     #cut(BORR_PD_LTVR_INTERACTION, c(2,4,6,8,10,12,14,16,18,20,22,24,27,30,35))) %>%
+    #cut(BORR_PD_PTI_INTERACTION, c(.2,.4,.6,.8,1,1.2,1.4,1.6,1.8,2,2.4,2.8))) %>% 
+     #cut(DEC_DEBT_TO_INCOME,c(-Inf,10,20,30,40,50))) %>% 
+    #SUB_CASH_DOWN_10_PCT_LESS) %>%
+   #VEHICLE_AGE_AT_PURCHASE) %>%
+   #POSITIVE_TRADEIN) %>% 
+   #ANY_TOTAL_DOWN) %>% 
+    #INCOME_DELTA) %>%
+   #MERCHANT_CATEGORY) %>% 
+   #VEHICLE_MAKE_CLEAN) %>% 
+   #CATEGORY_LEVEL_NAME) %>% 
+   #REGION) %>% 
+  summarise(cnt = n(), ASH5 = formattable::percent(mean(BAD)), 
+            Actual = formattable::percent(mean(New_DV)), 
+            ASH4 = formattable::percent(mean(ASH4_PD))) %>%
+    filter(cnt > 10),
+  aes(x = ASH5, y = Actual, key = Pred_bin, label = ASH4))+
+  geom_point(aes(size = cnt))+
+  geom_text(aes(label =  Pred_bin),hjust = -.5,vjust = .5,check_overlap = FALSE, size = 3)+
+  scale_x_continuous(labels = scales::percent_format(accuracy = 1L), limits = c(0,.4)) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1L), limits = c(0,.4)) +
+  geom_abline(aes(intercept = 0, slope = 1)) +
+  theme_minimal()+
+  ggtitle("Modeled Losses vs Actual")
+  , tooltip ="all")
+
+
+
+```
+
+## Risk Model Test
+
+```{r RM_test}
+#Now for the prediction
+risk_test_predictions <- predict(risk_glmnet_model, newx = risk_test_x, type = "response", s = "lambda.min") 
+risk_test_predictions <- cbind(risk_test_predictions,risk_test)
+risk_test_predictions <- risk_test_predictions %>% 
+  mutate(BAD = 1- lambda.min)
+
+risk_test_predictions %>%
+  summarise(Cnt = n(), ASH5 = round(auc(New_DV,BAD),4), 
+            ASH4 = round(auc(New_DV,ASH4_PD),4), 
+            Default_Rate = formattable::percent(mean(New_DV)), 
+            Default_Rate_Unaltered = formattable::percent(mean(DEPENDENT_VARIABLE)), 
+            ASH5_Rate = formattable::percent(mean(BAD)), 
+            ASH4_Rate = formattable::percent(mean(ASH4_PD))) %>%
+    gt() %>%
+  gt_theme_espn() %>%
+  tab_header(title = "Test AUC vs ASH4")
+
+```
+
+## Risk Model Holdout
+
+```{r RM_HOLDOUT, message=FALSE, warning=FALSE}
+risk_holdout_predictions <- predict(risk_glmnet_model, newx = risk_holdout_x, type = "response", s = "lambda.min") 
+risk_holdout_predictions <- cbind(risk_holdout_predictions,risk_holdout)
+risk_holdout_predictions <- risk_holdout_predictions %>% 
+  mutate(BAD = 1- lambda.min)
+
+risk_holdout_predictions %>%
+  summarise(Cnt = n(), 
+            ASH5 = round(auc(New_DV,BAD),4), 
+            ASH4 = round(auc(New_DV,ASH4_PD),4), 
+            Default_Rate = formattable::percent(mean(New_DV)), 
+            Default_Rate_Unaltered = formattable::percent(mean(DEPENDENT_VARIABLE)), 
+            ASH5_Rate = formattable::percent(mean(BAD)), 
+            ASH4_Rate = formattable::percent(mean(ASH4_PD))) %>%
+    gt() %>%
+  gt_theme_espn() %>%
+  tab_header(title = "Holdout AUC vs ASH4")
+
+```
+
+## Risk Model Evaluation
+
+```{r RM_TOTAL, message=FALSE, warning=FALSE}
+risk_predictions <- rbind(risk_train_predictions, risk_test_predictions, risk_holdout_predictions)
+
+
+risk_predictions %>%
+  summarise(Cnt = n(), 
+            ASH5 = round(auc(New_DV,BAD),4), 
+            ASH4 = round(auc(New_DV,ASH4_PD),4), 
+            Default_Rate = formattable::percent(mean(New_DV)), 
+            Default_Rate_Unaltered = formattable::percent(mean(DEPENDENT_VARIABLE)), 
+            ASH5_Rate = formattable::percent(mean(BAD)), 
+            ASH4_Rate = formattable::percent(mean(ASH4_PD))) %>%
+    gt() %>%
+  gt_theme_espn() %>%
+  tab_header(title = "Full AUC vs ASH4")
+
+
+
+risk_predictions_month <- risk_predictions %>%
+  group_by(Application_Month) %>%
+  summarise(cnt = n(), ASH5 = mean(BAD), Actual_Modified_DV = mean(New_DV), 
+            ASH4 = mean(ASH4_PD), Actual = mean(DEPENDENT_VARIABLE))
+
+preds_simple_risk <- risk_predictions %>%
+  select(ASH5 = BAD, ASH4_PD)
+preds_simple_risk <- melt(preds_simple_risk)
+
+ggplot(data = preds_simple_risk, aes(x = value, fill = variable))+
+  geom_density(alpha = .25)
+
+
+
+ggplotly(ggplot(data =  risk_predictions_month, aes(x = Application_Month)) +
+  geom_line(aes(y = Actual, color = "Actual"), size = 1) +
+  geom_line(aes(y = ASH5, color = "ASH5"),  size = 2) +
+  geom_line(aes(y = Actual_Modified_DV, color = "Actual_Modified_DV"),  size = 2) +
+  geom_line(aes(y = ASH4, color = "ASH4"), size = 1, linetype = "dashed") +
+   scale_color_manual(name = "Models",
+       values = c("Actual" = "Green",
+       "ASH5" = "orange",
+       "ASH4" = "red",
+       "Actual_Modified_DV" = "Dark Green"))+ 
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 90)) +
+  labs(title = "Month Prediction vs Actual") +
+  xlab("App_Month") +
+  ylab("24Mo Performance") +
+  scale_x_date(date_breaks = "months", date_labels = "%b-%y") +
+  scale_y_continuous(labels = scales::percent, limits = c(0,.15)))
+
+
+
+#Preds Vs Actual
+ggplotly(
+ggplot(data = risk_predictions %>%
+         #filter(TIER_GRADE != "SUB") %>% 
+  group_by(Pred_bin = #cut(DEC_PAYMENT_TO_INCOME, c(-Inf,0,2,4,6,8,10,12,14,16,Inf))) %>% 
+   #cut(BAD, c(-Inf, 0,.02,.4,.06,.08,.1,.12,.14,.16,.18,.2,Inf))) %>% 
+     #cut(TERM_OF_LOAN, c(-Inf,36,48,60,72,Inf)),
+   
+    #cut(TOTAL_DOWN_CONTRACT_PERCENT, c(-Inf,-20,-10,0,.01,5,10,20,30,40,50,Inf))) %>%
+    #cut(REBATE_PERCENT, c(-Inf,-20,-10,0,.01,5,10,20,30,40,50,Inf))) %>%
+     #cut(CASH_DOWN_CONTRACT_PERCENT, c(-Inf,0,.01,5,10,20,30,40,50,Inf))) %>%
+     #cut(TRADE_ALLOWANCE_PERCENT, c(-Inf,-20,-10,0,.01,5,10,20,30,40,50,Inf))) %>%
+    #cut(BORR_PD_WAINCOME, c(-Inf, 0,.02,.04,.06,.08,.1,.12,.14,.16,.18,.2,.25,.3,Inf))) %>% 
+     #cut(BORR_PD_FLTVR_INTERACTION, c(2,4,6,8,10,12,14,16,18,20,22,24,27,30,35))) %>%
+    #cut(BORR_PD_PTI_INTERACTION, c(.2,.4,.6,.8,1,1.2,1.4,1.6,1.8,2,2.4,2.8))) %>% 
+     #cut(BORR_SCORE, c(-Inf,110,130,140,150,160,170,180,190,200,210))) %>% 
+    #cut(LTVR, c(-Inf, 70,80,90,100,110,120,130,140,145,Inf))) %>%  
+     #bin2 = 
+    cut(VEHICLE_MILEAGE,c(-Inf,100,500,5000,20000,50000,100000))) %>% 
+   #cut(BACK_END, c(-Inf,1,5,10,15,Inf))) %>% 
+     #cut(DEC_DEBT_TO_INCOME,c(-Inf,10,20,30,40,50))) %>% 
+            #SUB_CASH_DOWN_10_PCT_LESS) %>%
+   #ANY_TOTAL_DOWN) %>% 
+   #VEHICLE_TYPE) %>% 
+    #TRADEIN) %>% 
+  #TRADEIN_CASH_DOWN) %>% 
+    #HIGH_END) %>% 
+   #VEHICLE_MAKE_CLEAN) %>% 
+   #MILEAGE_5000_LESS) %>% 
+   #VEHICLE_AGE_AT_PURCHASE) %>% 
+   #MERCHANT_CATEGORY) %>% 
+   #CATEGORY_LEVEL_NAME) %>% 
+   #MERCHANT_STATE) %>% 
+  #APP_DAY_OF_WEEK) %>% 
+   #REGION) %>% 
+  summarise(cnt = n(), ASH5 = formattable::percent(mean(BAD)), 
+            Actual = formattable::percent(mean(New_DV)), 
+            ASH4 = formattable::percent(mean(ASH4_PD))) %>%
+    filter(cnt > 100),
+  aes(x = ASH5, y = Actual#, key = bin2
+      , label = ASH4))+
+  geom_point(aes(size = cnt))+
+  geom_text(aes(label =  Pred_bin)#, label= bin2)
+            ,hjust = -.5,vjust = .5,check_overlap = FALSE, size = 3)+
+  scale_x_continuous(labels = scales::percent_format(accuracy = 1L), limits = c(0,.25)) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1L), limits = c(0,.25)) +
+  geom_abline(aes(intercept = 0, slope = 1)) +
+  theme_minimal()+
+  ggtitle("Modeled Losses vs Actual")
+)
+
+
+
+```
+
+## Risk LSA
+
+Reviewing the LSA to see if our variable trends from our model hold.
+
+```{r risk_lsa, include=FALSE}
+risk_LSA <- read.csv("RISK LSA.csv")
+risk_LSA <- risk_LSA %>% 
+  distinct()
+options(scipen = 999)
+
+mean(risk_LSA$LSA_COF)
+
+risk_LSA$NEW_USED <- toupper(risk_LSA$NEW_USED)
+risk_LSA <- risk_LSA %>% 
+  mutate(ANY_TOTAL_DOWN = case_when(TOTAL_DOWN_PCT_CALC != 0 ~ 1, TRUE ~ 0),
+         MILEAGE_5000_LESS = case_when(MILEAGE < 5000 ~1, TRUE ~0),
+         BORR_PD_LTVR_INTERACTION = ASH5.PD * LTV_REBATE_CALC,
+         BORR_PD_PTI_INTERACTION = ASH5.PD * PTI,
+         TRADEIN_CASH_DOWN = case_when(TRADEIN == 1 & CASH_DOWN_PCT_CALC > 0 ~1, TRUE ~0 ),
+         BACK_END = LTV_REBATE_CALC - LTV_FRONT_END_REBATE_CALC,
+         BORR_PD_FLTVR_INTERACTION = ASH5.PD * LTV_FRONT_END_REBATE_CALC)
+
+
+risk_LSA  %>% 
+  filter (LSA == 1) %>% 
+  filter(Borrower == "P") %>% 
+  #drop_na(LTV_REBATE_CALC) %>% 
+  #filter(LTV_REBATE_CALC < 200) %>%
+  filter(CREDIT_STATUS == "Approved") %>% 
+  #filter(NEW_USED != "") %>% 
+  group_by(bin = #CREDIT_STATUS) %>% 
+             #cut(LTV_REBATE_CALC, c(-Inf,70,85,95,115,130,Inf))) %>% 
+   #cut(TOTAL_DOWN_PCT_CALC, c(-Inf,-20,-10,0,.01,5,10,20,30,40,50,Inf))) %>% 
+     #cut(ASH5.PD, c(-Inf, 0,.02,.04,.06,.08,.1,.12,.14,.16,.18,.2,.25,.3,Inf))) %>% 
+     #cut(BORR_PD_FLTVR_INTERACTION, c(-Inf,2,4,6,8,10,12,14,16,18,20,25,30,35,Inf))) %>%
+  #cut(BORR_PD_PTI_INTERACTION, c(.2,.4,.6,.8,1,1.2,1.4,1.6,1.8,2,2.4,2.8))) %>% 
+     #cut(TOTAL_DOWN_PCT_CALC, c(-Inf,0,5,10,20,30,40,50,Inf))) %>% 
+    #cut(MILEAGE,c(-Inf,100,500,5000,20000,50000,100000, Inf))) %>% 
+  #cut(PTI, c(-Inf,0,2,4,6,8,10,12,14,16,Inf))) %>% 
+    #cut(BACK_END , c(-Inf,1,5,10,15,Inf))) %>% 
+    #MERCHANT_STATE) %>% 
+    #TRADEIN_CASH_DOWN) %>% 
+  #ANY_TOTAL_DOWN) %>% 
+    #VEHICLE_MAKE_CLEAN) %>% 
+  #VEHICLE_TYPE) %>%
+  APP_DAY_OF_WEEK) %>% 
+    #HIGH_END) %>% 
+    #MILEAGE_5000_LESS) %>% 
+    #Vehicle.Age) %>% 
+    #Merchant_Category) %>%
+  summarise(Count = n(), LSA_COF = formattable::percent(mean(LSA_COF))) %>% 
+  mutate(freq = formattable::percent(Count/sum(Count))) %>%
+  filter(Count >= 300) %>% 
+  select(bin, freq, LSA_COF) %>% 
+  gt() %>% 
+  gt_theme_espn()
+
+
+
+```
+
+## Risk Recent Apps
+
+```{r Risk_recent_Apps, eval=FALSE, message=FALSE, warning=FALSE, include=FALSE}
+###Remove other Excess variables
+risk_apps_recent_x <- risk_apps_recent_x %>%
+  as.data.frame() %>%
+  select(-c(#`MERCHANT_CATEGORYDirect partners`,MERCHANT_CATEGORYRateworks,
+            UNDERWRITING_TYPE_NAMEPagaya,
+            UNDERWRITING_TYPE_NAMEScorecard,`UNDERWRITING_TYPE_NAMEOpen Lending`,`VEHICLE_MAKE_CLEANASTON MARTIN`,
+            VEHICLE_MAKE_CLEANSMART, `PARENTASTON MARTIN`, MERCHANT_STATEDC, MERCHANT_STATENY, MERCHANT_STATEPA,
+            MERCHANT_STATEVA, #`TIER_MERCHANT_CATEGORYPRIME_NEAR_Direct partners`, TIER_MERCHANT_CATEGORYPRIME_NEAR_Rateworks,
+            #`TIER_MERCHANT_CATEGORYSUB_Direct partners`, TIER_MERCHANT_CATEGORYSUB_Rateworks, 
+            TIER_LTVRSUB_NA,
+            `TIER_PTIPRIME_NEAR_[-Inf,4)`, TIER_PTISUB_NA)) %>%
+  mutate(VEHICLE_MAKE_CLEANSMART = 0) %>%
+  as.matrix()
+
+# risk_train_x_df <- risk_train_x %>%
+# as.data.frame()
+# 
+# risk_apps_recent_x_df <- risk_apps_recent_x %>%
+#   as.data.frame()
+
+risk_apps_recent_preds <- predict(risk_glmnet_model, newx = risk_apps_recent_x, type = "response", s = "lambda.min")
+
+risk_apps_recent_preds <- risk_apps_recent_preds %>%
+  as.data.frame() %>%
+  mutate(BAD = 1- lambda.min)
+
+risk_apps_recent_preds <- cbind(risk_apps_recent,risk_apps_recent_preds)
+
+ ###Table
+ risk_apps_recent_preds %>%
+   filter(CREDIT_STATUS %in% c('Approved','Countered','Declined')) %>%
+   filter(UNDERWRITING_TYPE != '') %>%
+   group_by(MERCHANT_CATEGORY, UNDERWRITING_TYPE, CREDIT_STATUS) %>%
+   summarise(cnt = n(), ASH5 = formattable::percent(mean(BAD, na.rm = TRUE),2),
+             ASH4 = formattable::percent(mean(ASH4_risk_PD, na.rm = TRUE),2))  %>%
+   gt() %>%
+   gt_theme_espn() %>%
+   tab_header(title = "Predicted 24 Mo Default Rate by Borrower")
+            
+
+
+ #Histogram of PD
+ risk_apps_recent_preds_simple <- risk_apps_recent_preds %>%
+   filter(CREDIT_STATUS == "Approved") %>% 
+  select(ASH5_risk_PD = BAD, ASH4_risk_PD) %>%
+   
+   as.data.frame()
+
+ risk_apps_recent_preds_simple <- melt(risk_apps_recent_preds_simple)
+
+ggplot(data = risk_apps_recent_preds_simple, aes(x = value, fill = variable))+
+   geom_density(alpha = .25) +
+   scale_x_continuous(labels = scales::percent_format(accuracy = 1L),
+                      limits = c(0, .5))
+
+
+ggplot(data = risk_apps_recent_preds %>%
+                  filter(CREDIT_STATUS == "Approved")
+                  #tail(2000)
+                ,aes(x=BAD, y = ASH4_risk_PD))+#, color = BORR_PD_AVG_BIN)) +
+  geom_point(size = 2
+             , alpha = .01, color = "dark green")+
+  labs(title="ASH4 vs ASH5 scores") +
+  scale_x_continuous(limits=c(0,.6)) +
+  scale_y_continuous(limits=c(0,.6)) +
+  geom_abline(slope = 1)
+
+
+# risk_apps_recent %>%
+#   filter(CREDIT_STATUS == "Approved") %>%
+#   group_by(#cut(VEHICLE_MILEAGE,c(-Inf,100,500,5000,20000,50000,100000, Inf))) %>%
+#     #cut(TOTAL_DOWN_CONTRACT_PERCENT, c(-Inf,-20,-10,0,1,5,10,20,30,40,50, Inf))) %>%
+#   #cut(DEC_PAYMENT_TO_INCOME, c(-Inf,0,2,4,6,8,10,12,14,16,Inf))) %>%
+#     #cut(BORR_PD_WAINCOME, c(-Inf, 0,.02,.04,.06,.08,.1,.12,.14,.16,.18,.2,.25,.3,Inf))) %>%
+#     #cut(BORR_PD_FLTVR_INTERACTION, c(-Inf,2,4,6,8,10,12,14,16,18,20,25,30,35,Inf))) %>%
+#     #TRADEIN_CASH_DOWN) %>%
+#     #VEHICLE_AGE_AT_PURCHASE) %>%
+#     #cut(BACK_END, c(-Inf,1,5,10,15,Inf))) %>%
+#     #HIGH_END) %>%
+#     MERCHANT_STATE) %>%
+#   #APP_DAY_OF_WEEK) %>%
+#     #VEHICLE_TYPE) %>%
+#     #APP_DAY_OF_WEEK) %>%
+#     #MERCHANT_CATEGORY) %>%
+#   summarise(Count = n()) %>%
+#   #filter(Count >= 100) %>%
+#   mutate(freq = formattable::percent(Count/sum(Count))) %>%
+#   gt()
+
+
+```
+
+# Loss Given Default (LGD) {.tabset}
+
+**Objective:** Predict the loss given the event of a default of each application when applying for an auto loan with Foursight Capital. We are specifically targeting the lifetime rate of loss given default. Since our borrower model and risk model are predicting 24 month default rates and our LGD model is lifetime, we will need to make a conversion before combining the two.
+
+**Data Used:** Using loans that have charged off status as of 01-31-2022 but were charged-off before 03-31-2021. The reason is because loans charged off after 03-31-2021 had a low LGD due to high recovery values yielded by the market. We also removed any charged-off loan that had not seasoned at least 24 months since origination. In total we have close to 12,000 loans.
+
+We know that the loss given default of a vintage gradually decreases over time. This is due to post auction recoveries and lower LGD from loans that charge-off later in the life of the loan. By including only charged-off loans from younger vintages we artificially inflate our baseline LGD. In order to account for this we have created a LGD loss curve to be applied to all loans seasoned less than 72 months in this data set. The loss curve adjusts the LGD for individual loans. This is our traget variable.
+
+## Load Data, clean, and split
+
+```{r Get Data and Split, warning=FALSE}
+
+lgd_df <- read.csv("LGD.csv")
+
+lgd_df$BORR_PD_AVG <- rowMeans(lgd_df[,c(42,43)], na.rm = TRUE)*100
+
+lgd_df$BORR_PD_AVG[is.na(lgd_df$BORR_PD_AVG)] <- mean(lgd_df$BORR_PD_AVG, na.rm = TRUE)
+
+lgd_df$COF_PROBABILITY <- lgd_df$COF_PROBABILITY * 100
+
+
+  
+
+
+#Clean UP Data
+lgd_df <- lgd_df %>%
+  mutate(
+    Asset.Value.at.origination.of.New.Mean  = ifelse(
+      is.na(Asset.Value.at.origination.of.New),
+      mean(Asset.Value.at.origination.of.New, na.rm =  TRUE),
+      Asset.Value.at.origination.of.New
+    )
+  )
+
+lgd_df <- lgd_df %>%
+  mutate(
+    Asset.Value.2.years.after.origination.of.New.Mean  = ifelse(
+      is.na(Asset.Value.2.years.after.origination.of.New),
+      mean(Asset.Value.2.years.after.origination.of.New, na.rm =  TRUE),
+      Asset.Value.2.years.after.origination.of.New
+    )
+  )
+
+lgd_df <- lgd_df %>%
+  mutate(
+    Value.Retained.after.2.years.Mean  = ifelse(
+      is.na(Value.Retained.after.2.years),
+      mean(Value.Retained.after.2.years, na.rm =  TRUE),
+      Value.Retained.after.2.years
+    )
+  )
+
+#Binning
+lgd_df$Mileage_Bin <-
+  cut(
+    lgd_df$VEHICLE_MILEAGE,
+    breaks = c(-Inf, 500, 5000, 50000, 100000, 150000, Inf),
+    include.lowest = TRUE,
+    right = FALSE
+  )
+
+lgd_df$Term_Bin <-
+  cut(
+    lgd_df$TERM_OF_LOAN,
+    breaks = c(-Inf, 36,48,60,72,75, Inf),
+    include.lowest = TRUE,
+    right = FALSE
+  )
+
+lgd_df$Age_Bin <-
+  cut(
+    lgd_df$VEHICLE_AGE_AT_PURCHASE,
+    breaks = c(-Inf, 0,1,3,5,10, Inf),
+    include.lowest = TRUE,
+    right = FALSE
+  )
+
+lgd_df$FLTVR_Bin <-
+  cut(
+    lgd_df$FLTVR,
+    breaks = c(-Inf, 90,100,110,120,130, Inf),
+    include.lowest = TRUE,
+    right = FALSE
+  )
+
+lgd_df$Avg <- 34.09
+
+#Dec_Tree
+lgd_df <- lgd_df %>% 
+  mutate(DEC_TREE = case_when(FLTVR < 110 & VEHICLE_TYPE == "SUV       " ~ 31.16,
+                              FLTVR < 110 & VEHICLE_TYPE == "Truck     " ~ 26.44,
+                              FLTVR < 110 & VEHICLE_TYPE == "Sedan     " ~ 33.10,
+                              FLTVR < 130 & VEHICLE_TYPE == "SUV       " ~ 34.14,
+                              FLTVR < 130 & VEHICLE_TYPE == "Truck     " ~ 31.78,
+                              FLTVR < 130 & VEHICLE_TYPE == "Sedan     " ~ 35.42,
+                              FLTVR >= 130 & VEHICLE_TYPE == "SUV       " ~ 36.17,
+                              FLTVR >= 130 & VEHICLE_TYPE == "Truck     " ~ 33.63,
+                              FLTVR >= 130 & VEHICLE_TYPE == "Sedan     " ~ 37.41,
+                              VEHICLE_TYPE == "Van       " ~ 35.01,
+                              TRUE ~ 34.1
+)) 
+
+
+
+set.seed(24601)
+lgd_split <-
+  createDataPartition(
+    lgd_df$Forecasted.NCOF.Pct,
+    p = .75,
+    list = FALSE,
+    times = 1
+  )
+
+lgd_train <- lgd_df[lgd_split,]
+lgd_test <- lgd_df[-lgd_split,]
+
+
+```
+
+## LGD Model
+
+Our target variable is continuous so we are using a linear regression model. Our Mean Absolute Error is around 14.5, which means on average our preidction is off 14.5 points. This isn't great. We end up using 9 variables relating to the vehicle, structure and merchant category.
+
+```{r LGD_MODEL, message=FALSE, warning=FALSE}
+##I kept getting invalid connections. This function resolves that
+unregister_dopar <- function() {
+  env <- foreach:::.foreachGlobals
+  rm(list=ls(name=env), pos=env)
+}
+unregister_dopar()
+
+lgd_model_grid <-
+  expand.grid(alpha = 1, lambda = seq(0.9, 1, .1))
+
+lgd_model <- train(Forecasted.NCOF.Pct ~ LTVR 
+                   + NEW_OR_USED + VEHICLE_MAKE_CLEAN + 
+                     VEHICLE_AGE_AT_PURCHASE + VEHICLE_MILEAGE  
+                     + FLTVR + NEW_OR_USED + TOTAL_DOWN_CONTRACT_PERCENT + MERCHANT_CATEGORY + Age_Bin + 
+                     FLTVR_Bin + MERCHANT_STATE + BORR_PD_AVG  + Term_Bin + HIGH_END  
+                   + BORROWER_COUNT + COF_PROBABILITY 
+                   #Asset.Value.at.origination.of.New.Mean + Asset.Value.2.years.after.origination.of.New.Mean + Value.Retained.after.2.years.Mean 
+                    ,data = lgd_train, method = "glmnet",   tuneGrid = lgd_model_grid)
+
+lgd_model
+
+lgd_model$xlevels[["VEHICLE_MAKE_CLEAN"]] <- union(lgd_model$xlevels[["VEHICLE_MAKE_CLEAN"]], levels(as.factor(risk_df$VEHICLE_MAKE_CLEAN)))
+
+
+
+
+lgd_coef <-
+  coef(lgd_model$finalModel, lgd_model$finalModel$tuneValue$lambda)
+lgd_coef <- as.data.frame(as.matrix(lgd_coef))
+colnames(lgd_coef)[colnames(lgd_coef) == 's1'] <-
+  'Coefficients'
+
+lgd_coef <- subset(lgd_coef, Coefficients != 0)
+lgd_coef <-
+  setNames(cbind(rownames(lgd_coef), lgd_coef, row.names = NULL),
+           c("Attribute", "Coefficients"))
+
+lgd_coef %>%
+  gt() %>%
+  gt_theme_espn()
+
+
+
+
+
+```
+
+## LGD Train Evaluation
+
+To understand the difficulty in predicting LGD we show the histogram of actual LGD. It is widely spread out between 0 and 1. Our linear model predicts within a tight range bound. We also ran a decision tree model based solely on FLTVR and vehicle type. We also looked at how well a model performs if we just used a simple average. Overall our linear model performs best but not by much.
+
+```{r Predict on Train, message=FALSE, warning=FALSE}
+
+lgd_predictions <- predict(lgd_model, newdata = lgd_train)
+lgd_predictions <- cbind(lgd_predictions, lgd_train)
+
+#Histograms
+
+ggplot(lgd_predictions) + geom_histogram(aes(x=Forecasted.NCOF.Pct), fill = "blue", binwidth = .5) + 
+  scale_x_continuous(limits = c(0,100)) + 
+  labs(title = "Actuals")
+
+ggplot(lgd_predictions) + geom_histogram(aes(x=lgd_predictions), fill = "blue", binwidth = .5) + 
+  scale_x_continuous(limits = c(0,100)) + 
+  labs(title = "Linear Model")
+
+ggplot(lgd_predictions) + geom_histogram(aes(x=DEC_TREE), fill = "blue", binwidth = .5) + 
+  scale_x_continuous(limits = c(0,100))+
+  labs(title = "Decision Tree")
+
+
+# lgd_predictions %>% 
+#   group_by(Preds = cut_width(lgd_predictions, 2, boundary = 0)) %>% 
+#   summarise(cnt = n(), Prediction = mean(lgd_predictions), Actual = mean(Forecasted.NCOF.Pct)) %>% 
+#   gt() %>% 
+#   gt_theme_espn()
+
+# lgd_predictions %>% 
+#   group_by(VEHICLE_TYPE, VEHICLE_AGE_AT_PURCHASE) %>% 
+#   summarise(cnt = n(), Prediction = round(mean(lgd_predictions),2), Actual = round(mean(Forecasted.NCOF.Pct),2)) %>% 
+#   filter(cnt > 50) %>% 
+#   gt() %>% 
+#   gt_theme_espn() %>% 
+#   data_color(columns = c(Prediction), colors = green_white_red_color_scale) %>%
+#     data_color(columns = c(Actual), colors = green_white_red_color_scale) 
+
+
+lgd_predictions %>%
+  summarise(
+    cnt = n(),
+    mean = round(mean(Forecasted.NCOF.Pct),2),
+    Rsq = round(cor(lgd_predictions, Forecasted.NCOF.Pct) ^ 2, 3),
+    RMSE = round(rmse(Forecasted.NCOF.Pct, lgd_predictions), 2),
+    MAE = round(mae(Forecasted.NCOF.Pct, lgd_predictions), 2),
+    Rsq_34 = round(cor(Avg, Forecasted.NCOF.Pct) ^ 2, 3),
+    RMSE_34 = round(rmse(Forecasted.NCOF.Pct, 34.1), 2),
+    MAE34 = round(mae(Forecasted.NCOF.Pct, 34.1), 2),
+    Rsq_DT = round(cor(Type_DEC_Tree, Forecasted.NCOF.Pct) ^ 2, 3),
+    RMSE_DT = round(rmse(Forecasted.NCOF.Pct, Type_DEC_Tree), 2),
+    MAE_DT = round(mae(Forecasted.NCOF.Pct, Type_DEC_Tree), 2)) %>%
+  gt() %>%
+  gt_theme_espn()
+
+```
+
+## LGD Test Evaluation
+
+The decision tree now fits better than our linera model suggesting that perhaps our linear model is overfit.
+
+```{r LGD test, message=FALSE, warning=FALSE}
+lgd_predictions_test <- predict(lgd_model, newdata = lgd_test)
+lgd_predictions_test <- cbind(lgd_predictions_test, lgd_test)
+
+# lgd_predictions_test %>% 
+#   group_by(Preds = cut_width(lgd_predictions_test, 2, boundary = 0)) %>% 
+#   summarise(cnt = n(), Prediction = mean(lgd_predictions_test), Actual = mean(Forecasted.NCOF.Pct)) %>% 
+#   gt() %>% 
+#   gt_theme_espn()
+
+
+lgd_predictions_test %>%
+  summarise(
+    cnt = n(),
+    Rsq = round(cor(lgd_predictions_test, Forecasted.NCOF.Pct) ^ 2, 3),
+    RMSE = round(rmse(Forecasted.NCOF.Pct, lgd_predictions_test), 2),
+    MAE = round(mae(Forecasted.NCOF.Pct, lgd_predictions_test), 2),
+    RMSE_34 = round(rmse(Forecasted.NCOF.Pct, 34.1), 2),
+    MAE34 = round(mae(Forecasted.NCOF.Pct, 34.1), 2),
+    Rsq_DT = round(cor(DEC_TREE, Forecasted.NCOF.Pct) ^ 2, 3),
+    RMSE_DT = round(rmse(Forecasted.NCOF.Pct, DEC_TREE), 2),
+    MAE_DT = round(mae(Forecasted.NCOF.Pct, DEC_TREE), 2)
+  ) %>%
+  gt() %>%
+  gt_theme_espn()
+
+
+lgd_predictions_test <-  rename(lgd_predictions_test, lgd_predictions  = lgd_predictions_test)
+
+
+lgd_predictions_full <- rbind(lgd_predictions, lgd_predictions_test)
+
+
+ 
+```
+
+# PD and LGD
+
+When combining a 24 Month Probability of Default (PD) with a lifetime Loss Given Default (LGD), we must align the two. In order to do this we translate the 24 month PD into a lifetime PD by using a PD loss curve. The results is we divide the 24 Month PD by .4575 since we expect 45.75% of all charge-offs to occur on the first 24 months.
+
+```{r Merge PD and LGD}
+
+###Predict on Risk Data
+
+risk_predictions <- risk_predictions %>% 
+mutate(Truck_1Year_or_less = case_when(VEHICLE_TYPE == "Truck     " & VEHICLE_AGE_AT_PURCHASE <= 1 ~ 1, TRUE ~ 0))
+
+risk_predictions <- risk_predictions %>% 
+mutate(TRUCK_50k_less = case_when(VEHICLE_TYPE == "Truck     " & VEHICLE_MILEAGE < 50000 ~ 1, TRUE ~ 0))
+
+risk_predictions <- risk_predictions %>% 
+mutate(SUV_50k_plus = case_when(VEHICLE_TYPE == "SUV     " & VEHICLE_MILEAGE >= 50000 ~ 1, TRUE ~ 0))
+
+risk_predictions <- risk_predictions %>% 
+  mutate(COF_PROBABILITY= BAD * 100)
+
+#Binning
+risk_predictions$Mileage_Bin <-
+  cut(
+    risk_predictions$VEHICLE_MILEAGE,
+    breaks = c(-Inf, 500, 5000, 50000, 100000, 150000, Inf),
+    include.lowest = TRUE,
+    right = FALSE
+  )
+
+risk_predictions$Term_Bin <-
+  cut(
+    risk_predictions$TERM_OF_LOAN,
+    breaks = c(-Inf, 36,48,60,72, 75, Inf),
+    include.lowest = TRUE,
+    right = FALSE
+  )
+
+risk_predictions$Age_Bin <-
+  cut(
+    risk_predictions$VEHICLE_AGE_AT_PURCHASE,
+    breaks = c(-Inf, 0,1,3,5,10, Inf),
+    include.lowest = TRUE,
+    right = FALSE
+  )
+
+risk_predictions$FLTVR_Bin <-
+  cut(
+    risk_predictions$FLTVR,
+    breaks = c(-Inf, 90,100,110,120,130, Inf),
+    include.lowest = TRUE,
+    right = FALSE
+  )
+
+
+
+ncof_predictions <- predict(lgd_model, newdata = risk_predictions)
+ncof_predictions <- cbind(ncof_predictions,risk_predictions)
+
+```
+
+```{r NCOF, message=FALSE, warning=FALSE}
+
+ncof_predictions$Curve_Lifetime <- .4575
+ncof_predictions$PD_Lifetime <- ncof_predictions$BAD/ncof_predictions$Curve_Lifetime
+
+ncof_predictions$NCOFPct <- ncof_predictions$PD_Lifetime * (ncof_predictions$ncof_predictions/100)
+ncof_predictions$NCOFDollar <- ncof_predictions$ORIGINAL_PRINCIPAL_BALANCE * ncof_predictions$NCOFPct
+
+
+ncof_predictions %>% 
+  #group_by(Application_Month) %>%
+  summarise(cnt = n(), ASH5_Lifetime_PD = formattable::percent(mean(PD_Lifetime)), 
+            ASH5_LGD = formattable::percent(mean(ncof_predictions)/100), 
+            ASH5_NCOF_PCT = formattable::percent(sum(NCOFDollar)/sum(ORIGINAL_PRINCIPAL_BALANCE)), 
+            ASH4_NCOF_PCT = formattable::percent(sum(EXPECTED_LOSS_AMOUNT)/sum(ORIGINAL_PRINCIPAL_BALANCE))) %>% 
+  gt() %>% 
+  gt_theme_espn() %>% 
+  tab_header(title = "2018-2019H1 Predicted NCOF_PCT")
+
+
+# risk_apps_recent_preds <- risk_apps_recent_preds %>% 
+#   mutate(LGD = .3408,
+#          Curve_Lifetime = .4575)
+# 
+# risk_apps_recent_preds <-risk_apps_recent_preds %>% 
+#   mutate(ASH5_PD_Lifetime = BAD/Curve_Lifetime)
+# 
+# risk_apps_recent_preds <- risk_apps_recent_preds %>% 
+#   mutate(ASH5_NCOF_Pct = ASH5_PD_Lifetime * LGD)
+# 
+# 
+#  risk_apps_recent_preds %>%
+#    filter(CREDIT_STATUS %in% c('Approved','Countered','Declined')) %>%
+#    filter(UNDERWRITING_TYPE != '') %>%
+#    group_by(UNDERWRITING_TYPE, CREDIT_STATUS) %>% 
+#    summarise(cnt = n(), ASH5_PD = formattable::percent(mean(BAD, na.rm = TRUE),2),
+#              ASH4_PD = formattable::percent(mean(ASH4_risk_PD, na.rm = TRUE),2),
+#              ASH5_NCOF_Pct = formattable::percent(mean(ASH5_NCOF_Pct, na.rm = TRUE)),
+#              ASH4_NCOF_PCT = formattable::percent(mean(ASH4_Expected_Loss_Pct),2))  %>%
+#    gt() %>%
+#    gt_theme_espn() %>%
+#    tab_header(title = "2022Q1 Predict Default Rates")
+
+
+```
+
+```{r Stop_Cluster}
+#stopCluster(cl)
+```
