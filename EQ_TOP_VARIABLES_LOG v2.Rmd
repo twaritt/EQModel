@@ -58,7 +58,7 @@ green_white_red_color_scale <-
 white_green_color_scale <-
   scales::col_numeric(c("white", "dark green"), domain = NULL)
 
-
+#Commenting changes
 ```
 
 ## Data Cleanup
